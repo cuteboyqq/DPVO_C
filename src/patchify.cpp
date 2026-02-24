@@ -1,0 +1,823 @@
+#include "patchify.hpp"
+#include "fnet.hpp"
+#include "inet.hpp"
+#ifdef USE_ONNX_RUNTIME
+#include "fnet_onnx.hpp"
+#include "inet_onnx.hpp"
+#endif
+#include "correlation_kernel.hpp"
+#include "dla_config.hpp"
+#include "patchify_file_io.hpp"  // Patchify file I/O utilities
+#include "target_frame.hpp"  // Shared TARGET_FRAME constant
+#include "logger.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <algorithm>
+#include <stdexcept>
+#include <fstream>
+#include <string>
+#include <spdlog/spdlog.h>
+#include <sys/stat.h>  // For mkdir
+#include <sys/types.h>
+
+// Helper function to get bin_file directory path and ensure it exists
+static std::string get_bin_file_path(const std::string& filename) {
+    const std::string bin_dir = "bin_file";
+    
+    // Create directory if it doesn't exist
+    struct stat info;
+    if (stat(bin_dir.c_str(), &info) != 0) {
+        // Directory doesn't exist, create it
+        #ifdef _WIN32
+        mkdir(bin_dir.c_str());
+        #else
+        mkdir(bin_dir.c_str(), 0755);
+        #endif
+    }
+    
+    return bin_dir + "/" + filename;
+}
+
+// =================================================================================================
+// Patchifier Implementation
+// =================================================================================================
+Patchifier::Patchifier(int patch_size, int DIM)
+    : m_patch_size(patch_size), m_DIM(DIM), m_fnet(nullptr), m_inet(nullptr)
+#ifdef USE_ONNX_RUNTIME
+    , m_fnet_onnx(nullptr), m_inet_onnx(nullptr), m_useOnnxRuntime(false)
+#endif
+{
+}
+
+Patchifier::Patchifier(int patch_size, int DIM, Config_S *config)
+    : m_patch_size(patch_size), m_DIM(DIM)
+{
+    // Models will be set via setModels() if config provided
+    if (config != nullptr)
+    {
+        // Note: You'll need separate configs for fnet and inet
+        // For now, assuming same config path structure
+    }
+}
+
+Patchifier::~Patchifier()
+{
+    // Models will be automatically destroyed by unique_ptr
+}
+
+void Patchifier::setModels(Config_S *fnetConfig, Config_S *inetConfig)
+{
+    // Drop existing loggers if they exist (in case models were created elsewhere)
+    // This prevents "logger with name already exists" errors
+#ifdef SPDLOG_USE_SYSLOG
+    spdlog::drop("fnet");
+    spdlog::drop("inet");
+#else
+    spdlog::drop("fnet");
+    spdlog::drop("inet");
+#endif
+    
+    // Check if ONNX Runtime should be used
+#ifdef USE_ONNX_RUNTIME
+    bool useOnnx = false;
+    if (fnetConfig != nullptr && fnetConfig->useOnnxRuntime) {
+        useOnnx = true;
+    } else if (inetConfig != nullptr && inetConfig->useOnnxRuntime) {
+        useOnnx = true;
+    }
+    
+    m_useOnnxRuntime = useOnnx;
+    
+    if (useOnnx) {
+        // Use ONNX Runtime models
+        if (fnetConfig != nullptr) {
+            m_fnet_onnx = std::make_unique<FNetInferenceONNX>(fnetConfig);
+            m_fnet = nullptr;  // Clear AMBA model
+        }
+        if (inetConfig != nullptr) {
+            m_inet_onnx = std::make_unique<INetInferenceONNX>(inetConfig);
+            m_inet = nullptr;  // Clear AMBA model
+        }
+    } else {
+        // Use AMBA EazyAI models
+        if (fnetConfig != nullptr) {
+            m_fnet = std::make_unique<FNetInference>(fnetConfig);
+            m_fnet_onnx = nullptr;  // Clear ONNX model
+        }
+        if (inetConfig != nullptr) {
+            m_inet = std::make_unique<INetInference>(inetConfig);
+            m_inet_onnx = nullptr;  // Clear ONNX model
+        }
+    }
+#else
+    // ONNX Runtime not available, use AMBA models
+    if (fnetConfig != nullptr) {
+        m_fnet = std::make_unique<FNetInference>(fnetConfig);
+    }
+    if (inetConfig != nullptr) {
+        m_inet = std::make_unique<INetInference>(inetConfig);
+    }
+#endif
+}
+
+// Forward pass: fill fmap, imap, gmap, patches, clr
+// Note: fmap and imap are at 1/4 resolution (RES=4), but image and coords are at full resolution
+// image: normalized float image [C, H, W] with values in range [-0.5, 1.5] (Python: 2 * (image / 255.0) - 0.5)
+// Helper function to extract patches after inference has been run
+void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap_W, int M,
+                                                float* fmap, float* imap, float* gmap,
+                                                float* patches, uint8_t* clr, const uint8_t* image_for_colors,
+                                                int H_image, int W_image)
+{
+    const int inet_output_channels = 384;
+    
+    printf("[Patchifier] About to create coords, M=%d\n", M);
+    fflush(stdout);
+    
+    // ------------------------------------------------
+    // Generate RANDOM coords at FEATURE MAP resolution (matching Python)
+    // ------------------------------------------------
+    // CRITICAL: Python generates coordinates at feature map resolution (h, w from fmap.shape)
+    // Python: x = torch.randint(1, w-1, ...) where w is feature map width
+    //         y = torch.randint(1, h-1, ...) where h is feature map height
+    // These coordinates are used DIRECTLY for all patchify operations (no scaling)
+    //
+    // These random coordinates are used ONLY ONCE to initialize patches (landmarks)
+    // They define WHERE patches are extracted from the current frame
+    // 
+    // Later, in DPVO::update(), patches are tracked across frames using REPROJECTED coordinates:
+    //   - Stored patch coordinates (from this random initialization) are read from m_pg.m_patches[i][k]
+    //   - Reprojected to target frames using camera poses
+    //   - Correlation is computed at REPROJECTED locations (not random locations!)
+    //
+    // Why random? Ensures good spatial coverage of the image, avoids bias toward specific regions
+    // Each frame gets a fresh set of landmarks initialized at random locations
+    m_last_coords.resize(M * 2);
+    // Generate coordinates at FEATURE MAP resolution (matching Python)
+    for (int m = 0; m < M; m++)
+    {
+        m_last_coords[m * 2 + 0] = 1.0f + static_cast<float>(rand() % (fmap_W - 2));
+        m_last_coords[m * 2 + 1] = 1.0f + static_cast<float>(rand() % (fmap_H - 2));
+    }
+    const float* coords = m_last_coords.data();  // coords are at feature map resolution
+    printf("[Patchifier] Coords created at feature map resolution: fmap_H=%d, fmap_W=%d\n", fmap_H, fmap_W);
+    fflush(stdout);
+
+    printf("[Patchifier] About to call patchify_cpu_safe (gmap)\n");
+    fflush(stdout);
+    // ------------------------------------------------
+    // Patchify fmap → gmap (using coords directly at feature map resolution)
+    // ------------------------------------------------
+    patchify_cpu_safe(
+        fmap, coords,  // Use coords directly (already at feature map resolution)
+        M, 128, fmap_H, fmap_W,
+        m_patch_size / 2,
+        gmap);
+    printf("[Patchifier] patchify_cpu_safe (gmap) completed\n");
+    fflush(stdout);
+
+    printf("[Patchifier] About to call patchify_cpu_safe (imap)\n");
+    fflush(stdout);
+    // ------------------------------------------------
+    // imap sampling (radius = 0) - extract patches from m_imap_buffer
+    // Use coords directly (already at feature map resolution)
+    // ------------------------------------------------
+#ifdef USE_ONNX_RUNTIME
+    bool models_available = (m_useOnnxRuntime && m_fnet_onnx != nullptr && m_inet_onnx != nullptr) ||
+                             (!m_useOnnxRuntime && m_fnet != nullptr && m_inet != nullptr);
+#else
+    bool models_available = (m_fnet != nullptr && m_inet != nullptr);
+#endif
+    
+    if (models_available) {
+        float imap_buffer_sample_min = *std::min_element(m_imap_buffer.begin(), 
+                                                          m_imap_buffer.begin() + std::min(static_cast<size_t>(100), m_imap_buffer.size()));
+        float imap_buffer_sample_max = *std::max_element(m_imap_buffer.begin(), 
+                                                          m_imap_buffer.begin() + std::min(static_cast<size_t>(100), m_imap_buffer.size()));
+        printf("[Patchifier] Before patchify_cpu_safe (imap): m_imap_buffer sample range: [%f, %f], size=%zu\n", 
+               imap_buffer_sample_min, imap_buffer_sample_max, m_imap_buffer.size());
+        fflush(stdout);
+        
+        printf("[Patchifier] coords for imap extraction (at feature map resolution):\n");
+        for (int m = 0; m < std::min(M, 8); m++) {
+            printf("[Patchifier]   Patch %d: x=%.2f, y=%.2f (fmap_H=%d, fmap_W=%d)\n", 
+                   m, coords[m*2+0], coords[m*2+1], fmap_H, fmap_W);
+        }
+        fflush(stdout);
+        
+        patchify_cpu_safe(
+            m_imap_buffer.data(), coords,  // Use coords directly (already at feature map resolution)
+            M, inet_output_channels, fmap_H, fmap_W,
+            0,
+            imap);
+        
+        float imap_min = *std::min_element(imap, imap + M * m_DIM);
+        float imap_max = *std::max_element(imap, imap + M * m_DIM);
+        int imap_zero_count = 0;
+        int imap_nonzero_count = 0;
+        for (int i = 0; i < M * m_DIM; i++) {
+            if (imap[i] == 0.0f) imap_zero_count++;
+            else imap_nonzero_count++;
+        }
+        printf("[Patchifier] After patchify_cpu_safe (imap): imap stats - zero_count=%d, nonzero_count=%d, min=%f, max=%f\n",
+               imap_zero_count, imap_nonzero_count, imap_min, imap_max);
+        fflush(stdout);
+    } else {
+        std::fill(imap, imap + M * m_DIM, 0.0f);
+        printf("[Patchifier] WARNING: Models not available, zero-filling imap\n");
+        fflush(stdout);
+    }
+    printf("[Patchifier] patchify_cpu_safe (imap) completed\n");
+    fflush(stdout);
+
+    printf("[Patchifier] About to call patchify_cpu_safe (patches)\n");
+    fflush(stdout);
+    
+    // ------------------------------------------------
+    // Patchify grid → patches (RGB)
+    // Python: patches = altcorr.patchify(grid[0], coords, P//2)
+    // where grid is created from disps with shape (b, n, h, w) where h, w are feature map dimensions
+    // So coords are at feature map resolution, and grid is also at feature map resolution
+    // ------------------------------------------------
+    // CRITICAL: Grid must be created at FEATURE MAP resolution to match Python
+    // Python: grid, _ = coords_grid_with_index(disps, device=fmap.device)
+    // where disps = torch.ones(b, n, h, w) and h, w are feature map dimensions
+    std::vector<float> grid_fmap(3 * fmap_H * fmap_W);
+    for (int y = 0; y < fmap_H; y++) {
+        for (int x = 0; x < fmap_W; x++) {
+            int idx = y * fmap_W + x;
+            grid_fmap[0 * fmap_H * fmap_W + idx] = static_cast<float>(x);
+            grid_fmap[1 * fmap_H * fmap_W + idx] = static_cast<float>(y);
+            grid_fmap[2 * fmap_H * fmap_W + idx] = 1.0f;
+        }
+    }
+    
+    patchify_cpu_safe(
+        grid_fmap.data(), coords,  // coords are at feature map resolution, grid is also at feature map resolution
+        M, 3, fmap_H, fmap_W,
+        m_patch_size / 2,
+        patches);
+    
+    printf("[Patchifier] patchify_cpu_safe (patches) completed\n");
+    fflush(stdout);
+    
+    // Save patchify outputs (coords, gmap, imap, patches) for TARGET_FRAME when enabled
+    static int patchify_frame_counter = 0;
+    patchify_frame_counter++;
+    int current_patchify_frame = patchify_frame_counter - 1;  // 0-indexed
+    if (TARGET_FRAME >= 0 && current_patchify_frame == TARGET_FRAME) {
+        _savePatchifyResultsToBinFiles(current_patchify_frame, coords, gmap, imap, patches, M, inet_output_channels);
+    }
+
+    printf("[Patchifier] About to extract colors\n");
+    fflush(stdout);
+    // ------------------------------------------------
+    // Color for visualization - full resolution
+    // ------------------------------------------------
+    // CRITICAL: coords are at feature map resolution (fmap_H, fmap_W)
+    // but image_for_colors is at full resolution (H_image, W_image)
+    // Scale coordinates from feature map resolution to full image size
+    // Python: clr = altcorr.patchify(images[0], 4*(coords + 0.5), 0)
+    // where images[0] is at full resolution and coords are at feature map resolution
+    // The factor 4 scales from feature map to full resolution (RES=4)
+    if (image_for_colors != nullptr) {
+        int H_color = (H_image > 0) ? H_image : fmap_H * 4;  // Scale from feature map to full resolution
+        int W_color = (W_image > 0) ? W_image : fmap_W * 4;   // Scale from feature map to full resolution
+        float scale_x = static_cast<float>(W_color) / static_cast<float>(fmap_W);
+        float scale_y = static_cast<float>(H_color) / static_cast<float>(fmap_H);
+        
+        for (int m = 0; m < M; m++)
+        {
+            // Scale coordinates from feature map resolution to full image size
+            // Python uses: 4*(coords + 0.5), so we match that
+            float x_scaled = (coords[m * 2 + 0] + 0.5f) * scale_x;
+            float y_scaled = (coords[m * 2 + 1] + 0.5f) * scale_y;
+            int x = static_cast<int>(std::round(x_scaled));
+            int y = static_cast<int>(std::round(y_scaled));
+            x = std::max(0, std::min(x, W_color - 1));
+            y = std::max(0, std::min(y, H_color - 1));
+            for (int c = 0; c < 3; c++) {
+                // Image is in [C, H, W] format (uint8_t) at full resolution
+                clr[m * 3 + c] = image_for_colors[c * H_color * W_color + y * W_color + x];
+            }
+        }
+    } else {
+        // Fallback: zero fill if no image provided
+        std::fill(clr, clr + M * 3, 0);
+    }
+    printf("[Patchifier] Colors extracted\n");
+    fflush(stdout);
+}
+
+void Patchifier::_savePatchifyResultsToBinFiles(int frame_index, const float* coords, const float* gmap,
+                                                 const float* imap, const float* patches, int M,
+                                                 int inet_output_channels)
+{
+    auto logger_patch = spdlog::get("fnet");
+    if (!logger_patch) logger_patch = spdlog::get("inet");
+
+    std::string frame_suffix = std::to_string(frame_index);
+
+    std::string coords_filename = get_bin_file_path("cpp_coords_frame" + frame_suffix + ".bin");
+    patchify_file_io::save_coordinates(coords_filename, coords, M, logger_patch);
+
+    std::string gmap_filename = get_bin_file_path("cpp_gmap_frame" + frame_suffix + ".bin");
+    patchify_file_io::save_patch_data(gmap_filename, gmap, M, 128, m_patch_size, logger_patch, "gmap");
+
+    std::string imap_filename = get_bin_file_path("cpp_imap_frame" + frame_suffix + ".bin");
+    patchify_file_io::save_patch_data_hw(imap_filename, imap, M, inet_output_channels, 1, 1, logger_patch, "imap");
+
+    std::string patches_filename = get_bin_file_path("cpp_patches_frame" + frame_suffix + ".bin");
+    patchify_file_io::save_patch_data(patches_filename, patches, M, 3, m_patch_size, logger_patch, "patches");
+
+    if (logger_patch) {
+        logger_patch->info("[Patchifier] Saved patchify outputs for frame {}: {}, {}, {}, {}",
+                           frame_index, coords_filename, gmap_filename, imap_filename, patches_filename);
+    }
+}
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+// Tensor-based forward - uses tensor directly, avoids conversion (preferred for CV28)
+void Patchifier::forward(
+    ea_tensor_t* imgTensor,  // Input tensor (preferred, avoids conversion)
+    float* fmap, float* imap, float* gmap,
+    float* patches, uint8_t* clr,
+    int patches_per_image)
+{
+    if (imgTensor == nullptr) {
+        throw std::runtime_error("Patchifier::forward: imgTensor is nullptr");
+    }
+    
+    // Get dimensions from tensor (full image size)
+    const size_t* shape = ea_tensor_shape(imgTensor);
+    int H_tensor = static_cast<int>(shape[EA_H]);  // Full image height (e.g., 1080)
+    int W_tensor = static_cast<int>(shape[EA_W]);  // Full image width (e.g., 1920)
+    
+    // Get logger early (needed for dimension logging)
+    auto logger_patch = spdlog::get("fnet");
+    if (!logger_patch) {
+        logger_patch = spdlog::get("inet");
+    }
+    
+    // CRITICAL: Use model INPUT dimensions for patch extraction, not tensor dimensions
+    // Models resize internally, so patches should be extracted at model input size
+    // This ensures coordinates are within feature map bounds after scaling
+    int H = getInputHeight();  // Model input height (e.g., 528)
+    int W = getInputWidth();   // Model input width (e.g., 960)
+    
+    if (H == 0 || W == 0) {
+        // Fallback to tensor dimensions if model input not available
+        H = H_tensor;
+        W = W_tensor;
+        if (logger_patch) {
+            logger_patch->warn("[Patchifier] Model input dimensions not available, using tensor dimensions {}x{}", H, W);
+        }
+    } else {
+        if (logger_patch) {
+            logger_patch->info("[Patchifier] Using model input dimensions {}x{} for patch extraction (tensor is {}x{})", 
+                              H, W, H_tensor, W_tensor);
+        }
+    }
+    
+    // Use tensor-based runInference (avoids conversion)
+    const int M = patches_per_image;
+    const int inet_output_channels = 384;
+    int fmap_H = getOutputHeight();
+    int fmap_W = getOutputWidth();
+    
+    if (fmap_H == 0 || fmap_W == 0) {
+        throw std::runtime_error("Patchifier::forward: Model output dimensions not available");
+    }
+    
+    // Allocate buffers
+    if (m_fmap_buffer.size() != 128 * fmap_H * fmap_W) {
+        m_fmap_buffer.resize(128 * fmap_H * fmap_W);
+    }
+    if (m_imap_buffer.size() != inet_output_channels * fmap_H * fmap_W) {
+        m_imap_buffer.resize(inet_output_channels * fmap_H * fmap_W);
+    }
+    
+    // ---- Inference Cache: try loading from cache before running models ----
+    bool loaded_from_cache = _loadFromCache(fmap_H, fmap_W, inet_output_channels);
+    
+    if (!loaded_from_cache) {
+        // Cache miss → run inference
+    // Run inference using tensor directly
+#ifdef USE_ONNX_RUNTIME
+    if (m_useOnnxRuntime) {
+        // Use ONNX Runtime models
+        if (logger_patch) logger_patch->info("[Patchifier] About to call fnet_onnx->runInference (tensor)");
+        bool fnet_success = false;
+        if (m_fnet_onnx && !m_fnet_onnx->runInference(imgTensor, m_fmap_buffer.data())) {
+            if (logger_patch) logger_patch->error("[Patchifier] fnet_onnx->runInference (tensor) failed");
+            std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
+        } else {
+            fnet_success = true;
+            if (logger_patch) logger_patch->info("[Patchifier] fnet_onnx->runInference (tensor) successful");
+        }
+        
+        if (logger_patch) logger_patch->info("[Patchifier] About to call inet_onnx->runInference (tensor)");
+        bool inet_success = false;
+        if (m_inet_onnx && !m_inet_onnx->runInference(imgTensor, m_imap_buffer.data())) {
+            if (logger_patch) logger_patch->error("[Patchifier] inet_onnx->runInference (tensor) failed");
+            std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
+        } else {
+            inet_success = true;
+            if (logger_patch) logger_patch->info("[Patchifier] inet_onnx->runInference (tensor) successful");
+        }
+        
+        // Save ONNX model outputs for a specific frame to binary files for comparison with Python
+        // TARGET_FRAME is now defined in target_frame.hpp (shared across all files)
+        static int frame_counter = 0;
+        if (fnet_success && inet_success) {
+            frame_counter++;
+            int current_frame = frame_counter - 1;  // frame_counter is 1-indexed, current_frame is 0-indexed
+            
+            // Get output dimensions for logging
+            int fnet_C = 128;  // FNet output channels
+            int fnet_H = fmap_H;
+            int fnet_W = fmap_W;
+            int inet_C = inet_output_channels;  // INet output channels (384)
+            int inet_H = fmap_H;
+            int inet_W = fmap_W;
+            
+            // Save the target frame
+            if (TARGET_FRAME >= 0 && current_frame == TARGET_FRAME) {
+                std::string frame_suffix = std::to_string(TARGET_FRAME);
+                
+                // Save fnet output
+                std::string fnet_filename = get_bin_file_path("fnet_frame" + frame_suffix + ".bin");
+                patchify_file_io::save_model_output(fnet_filename, m_fmap_buffer.data(), 
+                                                     fnet_C, fnet_H, fnet_W, logger_patch, "fnet");
+                
+                // Save inet output
+                std::string inet_filename = get_bin_file_path("inet_frame" + frame_suffix + ".bin");
+                patchify_file_io::save_model_output(inet_filename, m_imap_buffer.data(), 
+                                                     inet_C, inet_H, inet_W, logger_patch, "inet");
+                
+                if (logger_patch) {
+                    logger_patch->info("[Patchifier] Saved ONNX outputs for frame {}: {} and {}", 
+                                      current_frame, fnet_filename, inet_filename);
+                }
+            }
+        }
+    } else {
+        // Use AMBA EazyAI models
+        if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference (tensor)");
+        bool amba_fnet_ok = false;
+        if (m_fnet && !m_fnet->runInference(imgTensor, m_fmap_buffer.data())) {
+            if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference (tensor) failed");
+            std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
+        } else {
+            amba_fnet_ok = true;
+            if (logger_patch) logger_patch->info("[Patchifier] fnet->runInference (tensor) successful");
+        }
+        
+        if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference (tensor)");
+        bool amba_inet_ok = false;
+        if (m_inet && !m_inet->runInference(imgTensor, m_imap_buffer.data())) {
+            if (logger_patch) logger_patch->error("[Patchifier] inet->runInference (tensor) failed");
+            std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
+        } else {
+            amba_inet_ok = true;
+            if (logger_patch) logger_patch->info("[Patchifier] inet->runInference (tensor) successful");
+        }
+
+        // Save AMBA model outputs at TARGET_FRAME for comparison with Python
+        if (amba_fnet_ok && amba_inet_ok) {
+            _saveAmbaOutputsForComparison(imgTensor, fmap_H, fmap_W, inet_output_channels, logger_patch);
+        }
+    }
+#else
+    // ONNX Runtime not available, use AMBA models
+    if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference (tensor)");
+    bool amba_fnet_ok2 = false;
+    if (!m_fnet->runInference(imgTensor, m_fmap_buffer.data())) {
+        if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference (tensor) failed");
+        std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
+    } else {
+        amba_fnet_ok2 = true;
+        if (logger_patch) logger_patch->info("[Patchifier] fnet->runInference (tensor) successful");
+    }
+    
+    if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference (tensor)");
+    bool amba_inet_ok2 = false;
+    if (!m_inet->runInference(imgTensor, m_imap_buffer.data())) {
+        if (logger_patch) logger_patch->error("[Patchifier] inet->runInference (tensor) failed");
+        std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
+    } else {
+        amba_inet_ok2 = true;
+        if (logger_patch) logger_patch->info("[Patchifier] inet->runInference (tensor) successful");
+    }
+
+    // Save AMBA model outputs at TARGET_FRAME for comparison with Python
+    if (amba_fnet_ok2 && amba_inet_ok2) {
+        _saveAmbaOutputsForComparison(imgTensor, fmap_H, fmap_W, inet_output_channels, logger_patch);
+    }
+#endif
+        // ---- Save to cache after inference (only when not loaded from cache) ----
+        _saveToCache(fmap_H, fmap_W, inet_output_channels);
+    } // end if (!loaded_from_cache)
+    
+    // Increment cache frame counter (always, whether loaded from cache or not)
+    m_cacheFrameCounter++;
+    
+    // Copy fmap buffer to output
+    std::memcpy(fmap, m_fmap_buffer.data(), 128 * fmap_H * fmap_W * sizeof(float));
+    
+    // Extract image data for color extraction (if needed)
+    // NOTE: Use tensor dimensions for color extraction (full resolution)
+    // But patches are extracted at model input size (H, W) which may be smaller
+    std::vector<uint8_t> image_data;
+    const uint8_t* image_for_colors = nullptr;
+    void* tensor_data = ea_tensor_data(imgTensor);
+    if (tensor_data != nullptr) {
+        image_data.resize(H_tensor * W_tensor * 3);
+        const uint8_t* src = static_cast<const uint8_t*>(tensor_data);
+        std::memcpy(image_data.data(), src, H_tensor * W_tensor * 3);
+        image_for_colors = image_data.data();
+    }
+    
+    // Extract patches using helper function (avoids duplicate inference)
+    // Pass both model input size (H, W) for patch extraction and tensor size for color extraction
+    extractPatchesAfterInference(H, W, fmap_H, fmap_W, M, fmap, imap, gmap, patches, clr, 
+                                 image_for_colors, H_tensor, W_tensor);
+}
+#endif
+
+int Patchifier::getOutputHeight() const
+{
+#ifdef USE_ONNX_RUNTIME
+    if (m_useOnnxRuntime && m_fnet_onnx != nullptr) {
+        return m_fnet_onnx->getOutputHeight();
+    }
+#endif
+    if (m_fnet != nullptr) {
+        return m_fnet->getOutputHeight();
+    }
+    return 0;
+}
+
+int Patchifier::getOutputWidth() const
+{
+#ifdef USE_ONNX_RUNTIME
+    if (m_useOnnxRuntime && m_fnet_onnx != nullptr) {
+        return m_fnet_onnx->getOutputWidth();
+    }
+#endif
+    if (m_fnet != nullptr) {
+        return m_fnet->getOutputWidth();
+    }
+    return 0;
+}
+
+int Patchifier::getInputHeight() const
+{
+#ifdef USE_ONNX_RUNTIME
+    if (m_useOnnxRuntime && m_fnet_onnx != nullptr) {
+        return m_fnet_onnx->getInputHeight();
+    }
+#endif
+    if (m_fnet != nullptr) {
+        return m_fnet->getInputHeight();
+    }
+    return 0;
+}
+
+int Patchifier::getInputWidth() const
+{
+#ifdef USE_ONNX_RUNTIME
+    if (m_useOnnxRuntime && m_fnet_onnx != nullptr) {
+        return m_fnet_onnx->getInputWidth();
+    }
+#endif
+    if (m_fnet != nullptr) {
+        return m_fnet->getInputWidth();
+    }
+    return 0;
+}
+
+// =====================================================================
+// Save AMBA FNet/INet outputs + input image + metadata at TARGET_FRAME
+// for comparison with Python ONNX inference
+// =====================================================================
+void Patchifier::_saveAmbaOutputsForComparison(
+    ea_tensor_t* imgTensor, int fmap_H, int fmap_W,
+    int inet_output_channels,
+    std::shared_ptr<spdlog::logger> logger)
+{
+    if (TARGET_FRAME < 0 || m_cacheFrameCounter != TARGET_FRAME) {
+        return;
+    }
+
+    const std::string frame_suffix = std::to_string(TARGET_FRAME);
+    const int fnet_C = 128;
+    const int fnet_H = fmap_H;
+    const int fnet_W = fmap_W;
+    const int inet_C = inet_output_channels;
+    const int inet_H = fmap_H;
+    const int inet_W = fmap_W;
+
+    // 1. Save FNet output [128, H, W]
+    std::string fnet_fn = get_bin_file_path("amba_fnet_frame" + frame_suffix + ".bin");
+    patchify_file_io::save_model_output(fnet_fn, m_fmap_buffer.data(),
+                                        fnet_C, fnet_H, fnet_W, logger, "amba_fnet");
+
+    // 2. Save INet output [384, H, W]
+    std::string inet_fn = get_bin_file_path("amba_inet_frame" + frame_suffix + ".bin");
+    patchify_file_io::save_model_output(inet_fn, m_imap_buffer.data(),
+                                        inet_C, inet_H, inet_W, logger, "amba_inet");
+
+    // 3. Save raw input image from tensor for Python to use the same input
+    const size_t* img_shape = ea_tensor_shape(imgTensor);
+    void* raw_data = ea_tensor_data(imgTensor);
+    if (raw_data && img_shape) {
+        int img_H = static_cast<int>(img_shape[EA_H]);
+        int img_W = static_cast<int>(img_shape[EA_W]);
+        int img_C = static_cast<int>(img_shape[EA_C]);
+        size_t img_size = static_cast<size_t>(img_H) * img_W * img_C;
+        std::string img_fn = get_bin_file_path("amba_input_image_frame" + frame_suffix + ".bin");
+        std::ofstream img_file(img_fn, std::ios::binary);
+        if (img_file.is_open()) {
+            img_file.write(reinterpret_cast<const char*>(raw_data), img_size * sizeof(uint8_t));
+            img_file.close();
+            if (logger) logger->info("[Patchifier] Saved AMBA input image to {}: {}x{}x{}",
+                                     img_fn, img_H, img_W, img_C);
+        }
+    }
+
+    // 4. Save metadata text file for Python comparison script
+    int img_H2 = img_shape ? static_cast<int>(img_shape[EA_H]) : 0;
+    int img_W2 = img_shape ? static_cast<int>(img_shape[EA_W]) : 0;
+    std::string meta_fn = get_bin_file_path("amba_model_metadata_frame" + frame_suffix + ".txt");
+    std::ofstream meta_file(meta_fn);
+    if (meta_file.is_open()) {
+        meta_file << "frame="          << TARGET_FRAME    << "\n";
+        meta_file << "input_image_H="  << img_H2          << "\n";
+        meta_file << "input_image_W="  << img_W2          << "\n";
+        meta_file << "model_input_H="  << getInputHeight() << "\n";
+        meta_file << "model_input_W="  << getInputWidth()  << "\n";
+        meta_file << "fnet_output_C="  << fnet_C           << "\n";
+        meta_file << "fnet_output_H="  << fnet_H           << "\n";
+        meta_file << "fnet_output_W="  << fnet_W           << "\n";
+        meta_file << "inet_output_C="  << inet_C           << "\n";
+        meta_file << "inet_output_H="  << inet_H           << "\n";
+        meta_file << "inet_output_W="  << inet_W           << "\n";
+        meta_file.close();
+        if (logger) logger->info("[Patchifier] Saved AMBA metadata to {}", meta_fn);
+    }
+
+    if (logger) {
+        logger->info("[Patchifier] Saved AMBA outputs for frame {}: {} and {}",
+                     m_cacheFrameCounter, fnet_fn, inet_fn);
+    }
+}
+
+// =====================================================================
+// Recursive mkdir helper
+// =====================================================================
+static void mkdirp(const std::string& path)
+{
+    struct stat info;
+    if (stat(path.c_str(), &info) == 0) return;  // already exists
+
+    size_t pos = path.find_last_of('/');
+    if (pos != std::string::npos && pos > 0) {
+        mkdirp(path.substr(0, pos));
+    }
+    mkdir(path.c_str(), 0755);
+}
+
+// =====================================================================
+// Inference Cache: save / load FNet/INet outputs to binary files
+// =====================================================================
+void Patchifier::setCachePath(const std::string& cachePath)
+{
+    m_cachePath = cachePath;
+    m_cacheEnabled = !cachePath.empty();
+    m_cacheFrameCounter = 0;
+    
+    if (m_cacheEnabled) {
+        // Create cache directories (including all parents)
+        mkdirp(cachePath);
+        std::string fnet_dir = cachePath + "/fnet";
+        std::string inet_dir = cachePath + "/inet";
+        mkdirp(fnet_dir);
+        mkdirp(inet_dir);
+        
+        auto logger = spdlog::get("fnet");
+        if (!logger) logger = spdlog::get("inet");
+        if (logger) {
+            logger->info("[Patchifier] Inference cache enabled: {}", cachePath);
+        }
+    }
+}
+
+bool Patchifier::_loadFromCache(int fmap_H, int fmap_W, int inet_C)
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) logger = spdlog::get("fnet");
+    
+    if (!m_cacheEnabled) {
+        if (logger && m_cacheFrameCounter == 0) {
+            logger->info("[Patchifier] Cache disabled (m_cacheEnabled=false)");
+        }
+        return false;
+    }
+    
+    std::string fnet_file = m_cachePath + "/fnet/frame_" + std::to_string(m_cacheFrameCounter) + ".bin";
+    std::string inet_file = m_cachePath + "/inet/frame_" + std::to_string(m_cacheFrameCounter) + ".bin";
+    
+    std::ifstream fnet_in(fnet_file, std::ios::binary);
+    std::ifstream inet_in(inet_file, std::ios::binary);
+    
+    if (!fnet_in.good() || !inet_in.good()) {
+        if (logger && m_cacheFrameCounter < 3) {
+            logger->info("[Patchifier] Cache MISS for frame {}: fnet={} ({}), inet={} ({})",
+                         m_cacheFrameCounter,
+                         fnet_file, fnet_in.good() ? "exists" : "NOT FOUND",
+                         inet_file, inet_in.good() ? "exists" : "NOT FOUND");
+        }
+        return false;  // Cache miss
+    }
+    
+    size_t fmap_size = 128 * fmap_H * fmap_W;
+    size_t imap_size = inet_C * fmap_H * fmap_W;
+    
+    // Verify file sizes match expected
+    fnet_in.seekg(0, std::ios::end);
+    inet_in.seekg(0, std::ios::end);
+    size_t fnet_file_size = fnet_in.tellg();
+    size_t inet_file_size = inet_in.tellg();
+    fnet_in.seekg(0, std::ios::beg);
+    inet_in.seekg(0, std::ios::beg);
+    
+    if (fnet_file_size != fmap_size * sizeof(float) ||
+        inet_file_size != imap_size * sizeof(float)) {
+        auto logger = spdlog::get("fnet");
+        if (logger) {
+            logger->warn("[Patchifier] Cache file size mismatch for frame {}. "
+                        "Expected fnet={} bytes (got {}), inet={} bytes (got {}). Re-running inference.",
+                        m_cacheFrameCounter,
+                        fmap_size * sizeof(float), fnet_file_size,
+                        imap_size * sizeof(float), inet_file_size);
+        }
+        return false;
+    }
+    
+    // Ensure buffers are allocated
+    if (m_fmap_buffer.size() != fmap_size) m_fmap_buffer.resize(fmap_size);
+    if (m_imap_buffer.size() != imap_size) m_imap_buffer.resize(imap_size);
+    
+    fnet_in.read(reinterpret_cast<char*>(m_fmap_buffer.data()), fmap_size * sizeof(float));
+    inet_in.read(reinterpret_cast<char*>(m_imap_buffer.data()), imap_size * sizeof(float));
+    fnet_in.close();
+    inet_in.close();
+    
+    if (logger) {
+        logger->info("\033[32mFNet: Loaded from cache: frame {}\033[0m", m_cacheFrameCounter);
+        logger->info("\033[32mINet: Loaded from cache: frame {}\033[0m", m_cacheFrameCounter);
+    }
+    return true;
+}
+
+void Patchifier::_saveToCache(int fmap_H, int fmap_W, int inet_C)
+{
+    if (!m_cacheEnabled) return;
+    
+    std::string fnet_file = m_cachePath + "/fnet/frame_" + std::to_string(m_cacheFrameCounter) + ".bin";
+    std::string inet_file = m_cachePath + "/inet/frame_" + std::to_string(m_cacheFrameCounter) + ".bin";
+    
+    size_t fmap_size = 128 * fmap_H * fmap_W;
+    size_t imap_size = inet_C * fmap_H * fmap_W;
+    
+    auto logger = spdlog::get("dpvo");
+    if (!logger) logger = spdlog::get("fnet");
+    
+    std::ofstream fnet_out(fnet_file, std::ios::binary);
+    if (fnet_out.good()) {
+        fnet_out.write(reinterpret_cast<const char*>(m_fmap_buffer.data()), fmap_size * sizeof(float));
+        fnet_out.close();
+    } else {
+        if (logger) logger->error("[Patchifier] Failed to write cache file: {}", fnet_file);
+    }
+    
+    std::ofstream inet_out(inet_file, std::ios::binary);
+    if (inet_out.good()) {
+        inet_out.write(reinterpret_cast<const char*>(m_imap_buffer.data()), imap_size * sizeof(float));
+        inet_out.close();
+    } else {
+        if (logger) logger->error("[Patchifier] Failed to write cache file: {}", inet_file);
+    }
+    
+    if (logger) {
+        if (m_cacheFrameCounter < 3) {
+            logger->info("\033[36mFNet: Saved to cache: {} ({} bytes)\033[0m", fnet_file, fmap_size * sizeof(float));
+            logger->info("\033[36mINet: Saved to cache: {} ({} bytes)\033[0m", inet_file, imap_size * sizeof(float));
+        } else {
+            logger->info("\033[36mFNet: Saved to cache: frame {}\033[0m", m_cacheFrameCounter);
+            logger->info("\033[36mINet: Saved to cache: frame {}\033[0m", m_cacheFrameCounter);
+        }
+    }
+}
+
