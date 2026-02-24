@@ -1,0 +1,121 @@
+# ---------------------------
+# dpvo_update.yaml
+# ---------------------------
+
+name: dpvo_update
+work_dir: ../../out/
+model_path: ../onnx_models/update.onnx  # ONNX model path
+
+# ---------------------------
+# 1️⃣ Prepare dummy inputs using GenArray
+# ---------------------------
+data_prepare:
+  net_data:
+    in_path: ../calibration_update/net
+    in_file_ext: bin
+    out_shape: 1,384,360,1
+    out_data_format: fp32
+    transforms:
+      - class: ReadBinaryFiles
+        arguments:
+          data_format: float32
+          shape: "1,384,360,1"
+
+  inp_data:
+    in_path: ../calibration_update/inp
+    in_file_ext: bin
+    out_shape: 1,384,360,1
+    out_data_format: fp32
+    transforms:
+      - class: ReadBinaryFiles
+        arguments:
+          data_format: float32
+          shape: "1,384,360,1"
+
+  corr_data:
+    in_path: ../calibration_update/corr
+    in_file_ext: bin
+    out_shape: 1,882,360,1
+    out_data_format: fp32
+    transforms:
+      - class: ReadBinaryFiles
+        arguments:
+          data_format: float32
+          shape: "1,882,360,1"
+
+  ii_data:
+    in_path: ../calibration_update/ii
+    in_file_ext: bin
+    out_shape: 1,1,360,1
+    out_data_format: fp32
+    transforms:
+      - class: ReadBinaryFiles
+        arguments:
+          data_format: float32
+          shape: "1,1,360,1"
+
+  jj_data:
+    in_path: ../calibration_update/jj
+    in_file_ext: bin
+    out_shape: 1,1,360,1
+    out_data_format: fp32
+    transforms:
+      - class: ReadBinaryFiles
+        arguments:
+          data_format: float32
+          shape: "1,1,360,1"
+
+  kk_data:
+    in_path: ../calibration_update/kk
+    in_file_ext: bin
+    out_shape: 1,1,360,1
+    out_data_format: fp32
+    transforms:
+      - class: ReadBinaryFiles
+        arguments:
+          data_format: float32
+          shape: "1,1,360,1"
+
+
+# ---------------------------
+# 2️⃣ Map model inputs
+# ---------------------------
+input_nodes:
+  net:
+    data_prepare: net_data
+  inp:
+    data_prepare: inp_data
+  corr:
+    data_prepare: corr_data
+  ii:
+    data_prepare: ii_data
+  jj:
+    data_prepare: jj_data
+  kk:
+    data_prepare: kk_data
+
+
+# ---------------------------
+# 3️⃣ Map model outputs (EXPLICIT SHAPES FOR CV28)
+# ---------------------------
+output_nodes:
+  net_out:
+    data_format: fp32
+    shape: 1,384,360,1
+
+  d_out:
+    data_format: fp32
+    shape: 1,2,360,1
+
+  w_out:
+    data_format: fp32
+    shape: 1,2,360,1
+
+
+# ---------------------------
+# 4️⃣ Conversion options
+# ---------------------------
+cnngen_convert:
+  dra_option:
+    strategy: auto
+
