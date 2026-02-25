@@ -21,8 +21,9 @@
 #include <unordered_map>
 #include <functional>
 
-// Forward declaration
+// Forward declarations
 class DPVOViewer;
+namespace spdlog { class logger; }
 
 struct DPVOConfig {
     int PATCHES_PER_FRAME;
@@ -296,7 +297,8 @@ private:
     
     // ---- Intrinsics and timestamp (stored as member variables) ----
     float m_intrinsics[4];      // Camera intrinsics [fx, fy, cx, cy]
-    int64_t m_currentTimestamp; // Current frame timestamp
+    int64_t m_currentTimestamp; // Current frame timestamp (written only by processing thread)
+    std::atomic<int64_t> m_nextInferenceTimestamp{1}; // Monotonic counter for inference; only inference thread writes
     
     // Inference thread (FNet/INet)
     std::thread m_inferenceThread;
@@ -304,6 +306,9 @@ private:
     std::mutex m_inferenceQueueMutex;
     std::condition_variable m_inferenceQueueCV;
     std::queue<InputFrame> m_inputFrameQueue;  // Input queue for inference thread
+    // Owned copy of input tensor data so we can run FNet/INet from it and then callback (drop resource)
+    // without use-after-free; only inference thread uses this.
+    std::vector<uint8_t> m_inferenceInputCopyBuffer;
     
     // Processing thread (patchify, reproject, correlation, update, BA, etc.)
     std::thread m_processingThread;
@@ -323,6 +328,10 @@ private:
     };
     std::unordered_map<int64_t, PerFrameTiming> m_frameTimings;
     std::mutex m_frameTimingsMutex;
+
+    // Log pipeline FPS for one frame and clear its timing entry (call from processing thread)
+    void _logAndClearPipelineTiming(int64_t frame_timestamp, double processing_ms,
+                                   const std::shared_ptr<spdlog::logger>& logger);
     
     // Helper function to check if there's work to do
     bool _hasWorkToDo();

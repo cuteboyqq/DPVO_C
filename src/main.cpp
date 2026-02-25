@@ -1520,7 +1520,9 @@ void processDPVOInput(
 
 		frameCondVar.notify_one();
 
-		// Asha cam style: wait for one frame processed (callback) then drop resource
+		// Wait for callback: inference thread signals when it has consumed this frame's tensor
+		// (so we can drop the resource and push the next frame; processing may still be running).
+		// This allows inference (frame N+1) and processing (frame N) to run in parallel.
 		if (frameProcessedMutex && frameProcessedCV && frameProcessed) {
 			std::unique_lock<std::mutex> lock(*frameProcessedMutex);
 			frameProcessedCV->wait(lock, [&]() { return *frameProcessed || !run_flag; });
@@ -1531,7 +1533,7 @@ void processDPVOInput(
 				std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
 
-		logger->info("Start ea_img_resource_drop_data (after processing complete)");
+		logger->info("Start ea_img_resource_drop_data (after inference consumed frame)");
 		RVAL_OK(ea_img_resource_drop_data(G_param->img_resource, &data));
 		logger->info("ea_img_resource_drop_data finished");
 	}

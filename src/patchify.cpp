@@ -628,20 +628,49 @@ void Patchifier::_saveAmbaOutputsForComparison(
     patchify_file_io::save_model_output(inet_fn, m_imap_buffer.data(),
                                         inet_C, inet_H, inet_W, logger, "amba_inet");
 
-    // 3. Save raw input image from tensor for Python to use the same input
+    // 3. Save raw input image from tensor for Python (pitch-aware → dense HWC)
+    //    AMBA tensor is NCHW with pitch; writing raw_data without pitch would mix in padding
+    //    and give wrong pixels after the first row. Copy with pitch then write dense HWC.
     const size_t* img_shape = ea_tensor_shape(imgTensor);
     void* raw_data = ea_tensor_data(imgTensor);
     if (raw_data && img_shape) {
         int img_H = static_cast<int>(img_shape[EA_H]);
         int img_W = static_cast<int>(img_shape[EA_W]);
         int img_C = static_cast<int>(img_shape[EA_C]);
-        size_t img_size = static_cast<size_t>(img_H) * img_W * img_C;
+        size_t pitch = ea_tensor_pitch(imgTensor);
+        size_t pitch_elem = pitch / sizeof(uint8_t);
+        const uint8_t* src = static_cast<const uint8_t*>(raw_data);
+        std::vector<uint8_t> dense_hwc(static_cast<size_t>(img_H) * img_W * img_C);
+        // NCHW with pitch: copy to dense (C,H,W) then to HWC
+        if (pitch_elem == static_cast<size_t>(img_W)) {
+            // Contiguous: copy NCHW → HWC
+            for (int y = 0; y < img_H; y++) {
+                for (int x = 0; x < img_W; x++) {
+                    for (int c = 0; c < img_C; c++) {
+                        size_t src_idx = static_cast<size_t>(c) * img_H * img_W + static_cast<size_t>(y) * img_W + x;
+                        size_t dst_idx = static_cast<size_t>(y) * img_W * img_C + static_cast<size_t>(x) * img_C + c;
+                        dense_hwc[dst_idx] = src[src_idx];
+                    }
+                }
+            }
+        } else {
+            // Pitch-aware: each channel row has pitch_elem elements
+            for (int c = 0; c < img_C; c++) {
+                for (int y = 0; y < img_H; y++) {
+                    const uint8_t* row = src + (static_cast<size_t>(c) * img_H + y) * pitch_elem;
+                    for (int x = 0; x < img_W; x++) {
+                        size_t dst_idx = static_cast<size_t>(y) * img_W * img_C + static_cast<size_t>(x) * img_C + c;
+                        dense_hwc[dst_idx] = row[x];
+                    }
+                }
+            }
+        }
         std::string img_fn = get_bin_file_path("amba_input_image_frame" + frame_suffix + ".bin");
         std::ofstream img_file(img_fn, std::ios::binary);
         if (img_file.is_open()) {
-            img_file.write(reinterpret_cast<const char*>(raw_data), img_size * sizeof(uint8_t));
+            img_file.write(reinterpret_cast<const char*>(dense_hwc.data()), dense_hwc.size() * sizeof(uint8_t));
             img_file.close();
-            if (logger) logger->info("[Patchifier] Saved AMBA input image to {}: {}x{}x{}",
+            if (logger) logger->info("[Patchifier] Saved AMBA input image to {}: {}x{}x{} (pitch-aware → dense HWC)",
                                      img_fn, img_H, img_W, img_C);
         }
     }

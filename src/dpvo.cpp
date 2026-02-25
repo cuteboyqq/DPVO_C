@@ -3040,6 +3040,31 @@ void DPVO::reportInferenceTime(int64_t frame_id, double ms)
     m_frameTimings[frame_id].inference_ms = ms;
 }
 
+void DPVO::_logAndClearPipelineTiming(int64_t frame_timestamp, double processing_ms,
+                                      const std::shared_ptr<spdlog::logger>& logger)
+{
+    std::lock_guard<std::mutex> tlock(m_frameTimingsMutex);
+    PerFrameTiming& t = m_frameTimings[frame_timestamp];
+    t.processing_ms = processing_ms;
+    double image_ms = (t.image_ms >= 0.0) ? t.image_ms : 0.0;
+    double inference_ms = (t.inference_ms >= 0.0) ? t.inference_ms : 0.0;
+    double max_ms = std::max({image_ms, inference_ms, processing_ms});
+    double pipeline_fps = (max_ms > 0.0) ? (1000.0 / max_ms) : 0.0;
+    double latency_ms = inference_ms + processing_ms;
+    double latency_fps = (latency_ms > 0.0) ? (1000.0 / latency_ms) : 0.0;
+    if (logger) {
+        logger->info("\033[33m[PIPELINE] Frame {} | Max (bottleneck): {:.2f} ms ({:.1f} FPS) [image: {:.2f} ms, inference: {:.2f} ms, processing: {:.2f} ms]\033[0m",
+                    frame_timestamp, max_ms, pipeline_fps, image_ms, inference_ms, processing_ms);
+        logger->info("\033[33m[PIPELINE] Frame {} | Latency (inference+processing, drives viewer): {:.2f} ms ({:.2f} FPS)\033[0m",
+                    frame_timestamp, latency_ms, latency_fps);
+    }
+    m_frameTimings.erase(frame_timestamp);
+    for (auto it = m_frameTimings.begin(); it != m_frameTimings.end(); ) {
+        if (it->first < frame_timestamp - 50) it = m_frameTimings.erase(it);
+        else ++it;
+    }
+}
+
 void DPVO::terminate() 
 {
     stopInferenceThread();
@@ -3213,20 +3238,13 @@ void DPVO::startInferenceThread()
                 lock.unlock();
                 
                 try {
-                    // Update timestamp (increment for each frame)
-                    int64_t previous_timestamp = m_currentTimestamp;
-                    m_currentTimestamp++;
+                    // Assign monotonic timestamp (only inference thread writes m_nextInferenceTimestamp;
+                    // processing thread writes m_currentTimestamp from result.timestamp — avoids race)
+                    int64_t frame_timestamp = m_nextInferenceTimestamp++;
                     
                     if (logger) {
-                        logger->info("Inference thread: Processing frame timestamp={} (previous={}, queue_size before pop={})", 
-                                    m_currentTimestamp, previous_timestamp, m_inputFrameQueue.size() + 1);
-                    }
-                    
-                    // Safety check: ensure timestamp is incrementing
-                    if (m_currentTimestamp <= previous_timestamp) {
-                        if (logger) logger->error("Inference thread: Timestamp not incrementing! previous={}, current={}", 
-                                                  previous_timestamp, m_currentTimestamp);
-                        m_currentTimestamp = previous_timestamp + 1;
+                        logger->info("Inference thread: Processing frame timestamp={} (queue_size before pop={})", 
+                                    frame_timestamp, m_inputFrameQueue.size() + 1);
                     }
                     
                     // Get model output dimensions
@@ -3242,7 +3260,6 @@ void DPVO::startInferenceThread()
                     
                     // Allocate buffers for inference results
                     InferenceResult result;
-                    int64_t frame_timestamp = m_currentTimestamp;  // Capture timestamp at start
                     result.timestamp = frame_timestamp;
                     result.H = frame.H;
                     result.W = frame.W;
@@ -3263,24 +3280,51 @@ void DPVO::startInferenceThread()
                     auto t_inference_start = std::chrono::steady_clock::now();
                     
                     if (logger) {
-                        logger->info("Inference thread: About to run FNet/INet inference for frame timestamp={} (m_currentTimestamp={})", 
-                                    frame_timestamp, m_currentTimestamp);
+                        logger->info("Inference thread: About to run FNet/INet inference for frame timestamp={}", 
+                                    frame_timestamp);
                     }
                     
 #if defined(CV28) || defined(CV28_SIMULATOR)
                     if (frame.tensor_img != nullptr) {
-                        // Run patchifier.forward() which does FNet/INet inference and extracts patches
+                        // Copy input tensor into our buffer so we can callback (drop resource) right after
+                        // inference without use-after-free; FNet/INet then run from our copy.
+                        const size_t* shape_src = ea_tensor_shape(frame.tensor_img);
+                        size_t pitch_src = ea_tensor_pitch(frame.tensor_img);
+                        size_t C = shape_src[EA_C], H = shape_src[EA_H], W = shape_src[EA_W];
+                        size_t copy_size = C * H * pitch_src;
+                        m_inferenceInputCopyBuffer.resize(copy_size);
+                        const uint8_t* src_data = static_cast<const uint8_t*>(ea_tensor_data(frame.tensor_img));
+                        if (src_data != nullptr) {
+                            for (size_t c = 0; c < C; c++) {
+                                for (size_t y = 0; y < H; y++) {
+                                    const uint8_t* row_src = src_data + (c * H + y) * pitch_src;
+                                    uint8_t* row_dst = m_inferenceInputCopyBuffer.data() + (c * H + y) * pitch_src;
+                                    memcpy(row_dst, row_src, pitch_src);
+                                }
+                            }
+                        }
+                        size_t shape_nchw[4] = { 1, C, H, W };
+                        ea_tensor_t* copy_tensor = ea_tensor_new_from_other_buffer(
+                            EA_MEM_HEAP, 0, EA_U8, shape_nchw, pitch_src,
+                            m_inferenceInputCopyBuffer.data(), 0);
+                        if (copy_tensor == nullptr) {
+                            if (logger) logger->error("Inference thread: ea_tensor_new_from_other_buffer failed");
+                            lock.lock();
+                            continue;
+                        }
+                        // Run FNet/INet from our copy (resource can be dropped after callback)
                         m_patchifier.forward(
-                            frame.tensor_img,
-                            result.fmap_buffer.data(),  // Full FNet feature map
-                            result.imap_patches.data(), // INet patch features
-                            result.gmap_patches.data(),  // FNet patch features
-                            result.patches.data(),       // Extracted patches
-                            result.clr.data(),           // Patch colors
+                            copy_tensor,
+                            result.fmap_buffer.data(),
+                            result.imap_patches.data(),
+                            result.gmap_patches.data(),
+                            result.patches.data(),
+                            result.clr.data(),
                             M
                         );
-                        
-                        // Extract image data for viewer (if visualization enabled)
+                        ea_tensor_free(copy_tensor);
+                        copy_tensor = nullptr;
+                        // Viewer image from original tensor (still valid until we callback)
                         if (m_visualizationEnabled) {
                             result.image_data.resize(frame.H * frame.W * 3);
                             void* tensor_data = ea_tensor_data(frame.tensor_img);
@@ -3294,8 +3338,6 @@ void DPVO::startInferenceThread()
                         } else {
                             result.image_ptr = nullptr;
                         }
-                        
-                        // Main thread owns tensor and drops resource after isProcessingComplete()
                         result.tensor_img = nullptr;
                     } else {
                         if (logger) logger->error("Inference thread: frame.tensor_img is nullptr!");
@@ -3325,6 +3367,12 @@ void DPVO::startInferenceThread()
                         if (logger) logger->debug("Inference thread: Pushed result to queue, queue_size={}", m_inferenceResultQueue.size());
                     }
                     m_inferenceResultCV.notify_one();
+
+                    // Notify image thread that we're done with this frame's tensor (safe to drop).
+                    // This allows the next frame to be pushed while the processing thread still
+                    // works on this frame, so inference and processing can run in parallel.
+                    if (m_frameProcessedCallback)
+                        m_frameProcessedCallback();
                     
                 } catch (const std::exception& e) {
                     if (logger) logger->error("Exception in inference thread: {}", e.what());
@@ -3415,31 +3463,8 @@ void DPVO::startProcessingThread()
                         logger->info("\033[33m[DPVO_THREAD] Frame {} | DPVO processing (patchify, reproject, correlation, update, BA): {:.2f} ms ({:.1f} FPS)\033[0m", 
                                     result.timestamp, processing_ms, processing_fps);
                     }
-                    // Aggregate three-thread times for this frame and log overall pipeline FPS
-                    {
-                        std::lock_guard<std::mutex> tlock(m_frameTimingsMutex);
-                        PerFrameTiming& t = m_frameTimings[result.timestamp];
-                        t.processing_ms = processing_ms;
-                        double image_ms = (t.image_ms >= 0.0) ? t.image_ms : 0.0;
-                        double inference_ms = (t.inference_ms >= 0.0) ? t.inference_ms : 0.0;
-                        double max_ms = std::max({image_ms, inference_ms, processing_ms});
-                        double pipeline_fps = (max_ms > 0.0) ? (1000.0 / max_ms) : 0.0;
-                        double latency_ms = inference_ms + processing_ms;
-                        double latency_fps = (latency_ms > 0.0) ? (1000.0 / latency_ms) : 0.0;
-                        if (logger) {
-                            logger->info("\033[33m[PIPELINE] Frame {} | Max (bottleneck): {:.2f} ms ({:.1f} FPS) [image: {:.2f} ms, inference: {:.2f} ms, processing: {:.2f} ms]\033[0m",
-                                        result.timestamp, max_ms, pipeline_fps, image_ms, inference_ms, processing_ms);
-                            logger->info("\033[33m[PIPELINE] Frame {} | Latency (inference+processing, drives viewer): {:.2f} ms ({:.2f} FPS)\033[0m",
-                                        result.timestamp, latency_ms, latency_fps);
-                        }
-                        m_frameTimings.erase(result.timestamp);
-                        // Prune old entries to avoid unbounded growth
-                        for (auto it = m_frameTimings.begin(); it != m_frameTimings.end(); ) {
-                            if (it->first < result.timestamp - 50) it = m_frameTimings.erase(it);
-                            else ++it;
-                        }
-                    }
-                    
+                    _logAndClearPipelineTiming(result.timestamp, processing_ms, logger);
+                
                 } catch (const std::exception& e) {
                     if (logger) logger->error("Exception in processing thread: {}", e.what());
                 } catch (...) {
@@ -3447,8 +3472,8 @@ void DPVO::startProcessingThread()
                 }
                 
                 m_bDone = true;
-                if (m_frameProcessedCallback)
-                    m_frameProcessedCallback();
+                // Frame-processed callback is invoked by inference thread (after push to result queue)
+                // so that the image thread can push the next frame sooner and inference/processing overlap.
                 lock.lock();
             }
         }
