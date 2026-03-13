@@ -28,6 +28,54 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+#if defined(CV28) || defined(CV28_SIMULATOR)
+// Unproject 2D image point (u,v) to 3D world point. Same convention as BA/projective_ops:
+// ray in camera frame = (X0, Y0, Z0=1) with X0=(u-cx)/fx, Y0=(v-cy)/fy (forward = +Z).
+// T_wc = world to camera. Intrinsics fx,fy,cx,cy for the same resolution as (u,v).
+// Tries ground plane y=0, then z=0, then fixed depth. Returns true and writes *out.
+static bool unprojectToGroundPlane(float fx, float fy, float cx, float cy,
+    const SE3& T_wc, float u, float v, Vec3* out)
+{
+    if (out == nullptr) return false;
+    // Match projective_ops: normalized ray (X0, Y0, 1) so reprojection is consistent with patches
+    Eigen::Vector3f d_c(static_cast<float>((u - cx) / fx), static_cast<float>((v - cy) / fy), 1.0f);
+    float n = d_c.norm();
+    if (n < 1e-6f) return false;
+    d_c /= n;
+    SE3 T_cw = T_wc.inverse();
+    Eigen::Vector3f origin_w = T_cw.t;
+    Eigen::Matrix3f R_cw = T_cw.R();
+    Eigen::Vector3f d_w = R_cw * d_c;
+    const float eps = 1e-5f;
+    const float max_ground_dist = 50.0f;  // Cap distance to avoid far outliers in 3D viewer
+    float t = -1.0f;
+    // Try ground plane y = 0 (Y-up convention)
+    if (std::abs(d_w.y()) > eps) {
+        t = (0.0f - origin_w.y()) / d_w.y();
+        if (t > 0.0f && t <= max_ground_dist) {
+            Eigen::Vector3f P_w = origin_w + t * d_w;
+            out->x = P_w.x(); out->y = P_w.y(); out->z = P_w.z();
+            return true;
+        }
+    }
+    // Try ground plane z = 0 (Z-up convention, common in robotics / viewer)
+    if (std::abs(d_w.z()) > eps) {
+        t = (0.0f - origin_w.z()) / d_w.z();
+        if (t > 0.0f && t <= max_ground_dist) {
+            Eigen::Vector3f P_w = origin_w + t * d_w;
+            out->x = P_w.x(); out->y = P_w.y(); out->z = P_w.z();
+            return true;
+        }
+    }
+    // Fallback: fixed depth (e.g. 5m) so detections still appear in 3D for debugging
+    const float fixed_depth = 5.0f;
+    Eigen::Vector3f P_c = d_c * fixed_depth;
+    Eigen::Vector3f P_w = origin_w + R_cw * P_c;
+    out->x = P_w.x(); out->y = P_w.y(); out->z = P_w.z();
+    return true;
+}
+#endif
+
 // Helper function to get bin_file directory path and ensure it exists
 static std::string get_bin_file_path(const std::string& filename) {
     const std::string bin_dir = "bin_file";
@@ -135,6 +183,7 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
 
     // Initialize intrinsics from config or use defaults
     if (config != nullptr) {
+        m_enableShow3DDetection = config->enableShow3DDetection;
         setIntrinsicsFromConfig(config);
 #ifdef USE_ONNX_RUNTIME
         if (config->useOnnxRuntime) {
@@ -196,13 +245,30 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
     m_reshape_ii_input.resize(1 * 1 * m_maxEdge * 1, 0.0f);
     m_reshape_jj_input.resize(1 * 1 * m_maxEdge * 1, 0.0f);
     m_reshape_kk_input.resize(1 * 1 * m_maxEdge * 1, 0.0f);
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    if (config != nullptr && config->enableYOLOv8 && !config->yolov8ModelPath.empty()) {
+#ifdef USE_ONNX_RUNTIME
+        if (config->useOnnxRuntime) {
+            m_yolov8_onnx = std::make_unique<YOLOv8ONNX>(config);
+            if (m_yolov8_onnx->isReady())
+                m_yolov8Decoder = std::make_unique<YOLOv8_Decoder>(
+                    m_yolov8_onnx->getInputHeight(), m_yolov8_onnx->getInputWidth(), "dpvo");
+        } else
+#endif
+        {
+            m_yolov8 = std::make_unique<YOLOv8>(config, nullptr);
+            m_yolov8Decoder = std::make_unique<YOLOv8_Decoder>(YOLOV8_MODEL_HEIGHT, YOLOV8_MODEL_WIDTH, "dpvo");
+        }
+    }
+#endif
 }
 
 void DPVO::_startThreads()
 {
 #if defined(CV28) || defined(CV28_SIMULATOR)
-    startInferenceThread();   // Start inference thread (FNet/INet)
-    startProcessingThread();   // Start processing thread (patchify, reproject, correlation, update, BA)
+    startProcessingThread();
+    m_processingThreadRunning = true;
 #endif
 }
 
@@ -357,10 +423,6 @@ void DPVO::setIntrinsicsFromConfig(Config_S* config)
     }
 
 DPVO::~DPVO() {
-    // Stop both threads
-    stopInferenceThread();
-    stopProcessingThread();
-    
     // Update model will be automatically destroyed by unique_ptr
     delete[] m_imap;
     delete[] m_gmap;
@@ -408,23 +470,10 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     m_pg.m_tstamps[n_use] = timestamp;
     
     // Store timestamp in historical buffer for mapping sliding window to global indices
-    // CRITICAL: Use timestamp as index (timestamps are sequential: 1, 2, 3, ...)
-    // This ensures correct storage even if frames are processed out of order
-    // Timestamps start from 1, so use timestamp - 1 as array index
-    int timestamp_idx = static_cast<int>(timestamp) - 1;
-    if (timestamp_idx < 0) {
-        if (logger) logger->error("DPVO::runAfterPatchify: Invalid timestamp {} (must be >= 1)", timestamp);
-        timestamp_idx = 0;
+    if (static_cast<int>(m_allTimestamps.size()) <= m_counter) {
+        m_allTimestamps.resize(m_counter + 1);
     }
-    if (static_cast<int>(m_allTimestamps.size()) <= timestamp_idx) {
-        m_allTimestamps.resize(timestamp_idx + 1);
-    }
-    // Check if this timestamp was already stored (shouldn't happen, but protect against duplicates)
-    if (m_allTimestamps[timestamp_idx] != 0 && m_allTimestamps[timestamp_idx] != timestamp) {
-        if (logger) logger->error("DPVO::runAfterPatchify: Timestamp collision at index {}: existing={}, new={}", 
-                                  timestamp_idx, m_allTimestamps[timestamp_idx], timestamp);
-    }
-    m_allTimestamps[timestamp_idx] = timestamp;
+    m_allTimestamps[m_counter] = timestamp;
 
     // Store camera intrinsics
     // CRITICAL: Patches are extracted at model input size (e.g., 528x960), not full image size (e.g., 1080x1920)
@@ -457,8 +506,13 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     //   - Scale intrinsics: (model_W / W) / RES for x, (model_H / H) / RES for y
     //   - This matches Python if images are already resized to match model input size
     const float RES = 4.0f;
-    float scale_x = 0.26666f; // 0.3333f; (352x640) //0.5f; // static_cast<float>(model_W) / static_cast<float>(W);  // Model input / Input image width
-    float scale_y = 0.26666f; // 0.3333f; (352x640) //0.5f; // static_cast<float>(model_H) / static_cast<float>(H);  // Model input / Input image height
+    //-----------------------------------------------------------------------------------------------------
+    // Notes:
+    // Disable using scale_x and scale_y, user need to calculate correct intrinsic by intrinsic * scale
+    // And write intrinsic * scale in app_config.txt
+    //---------------------------------------------------------------------------------------------------------
+    float scale_x = 0.26666f; //1.6f; // 0.26666f; iphone // 0.3333f; (352x640) //0.5f; // static_cast<float>(model_W) / static_cast<float>(W);  // Model input / Input image width
+    float scale_y = 0.26666f; // 0.9f; // 0.26666f; iphone // 0.3333f; (352x640) //0.5f; // static_cast<float>(model_H) / static_cast<float>(H);  // Model input / Input image height
     
     float scaled_intrinsics[4];
     scaled_intrinsics[0] = intrinsics_to_use[0] * scale_x / RES;  // fx: scale to model input, then to feature map
@@ -552,11 +606,10 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     // Store pose in historical buffer for visualization
     // Store immediately after initialization to ensure consecutive poses
     // Bundle adjustment will update these poses later via sync mechanism
-    // Use same timestamp index as for m_allTimestamps (already computed above)
-    if (static_cast<int>(m_allPoses.size()) <= timestamp_idx) {
-        m_allPoses.resize(timestamp_idx + 1);
+    if (static_cast<int>(m_allPoses.size()) <= m_counter) {
+        m_allPoses.resize(m_counter + 1);
     }
-    m_allPoses[timestamp_idx] = m_pg.m_poses[n_use];
+    m_allPoses[m_counter] = m_pg.m_poses[n_use];
     
 
     // -------------------------------------------------
@@ -756,14 +809,11 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     }
 
     // -------------------------------------------------
-    // 7. Counter update (before motion probe check, matching Python)
+    // 7. Counter increment (before motion probe check, matching Python)
     // -------------------------------------------------
     // Python: self.counter += 1 (line 1337) happens BEFORE motion probe check
     // This ensures counter is incremented even if frame is skipped
-    // CRITICAL: Update m_counter to track the maximum timestamp processed
-    // This ensures m_counter reflects the actual number of frames processed
-    // (timestamps are sequential: 1, 2, 3, ..., so timestamp = frame number)
-    m_counter = std::max(m_counter, static_cast<int>(timestamp));
+    m_counter++;
 
     // -------------------------------------------------
     // 8. Motion probe check
@@ -994,11 +1044,115 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
             image_for_viewer = image_data.data();
         }
     }
-    
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+#ifdef USE_ONNX_RUNTIME
+    if (m_yolov8_onnx != nullptr && m_yolov8_onnx->isReady()) {
+        auto t_yolo_start = std::chrono::steady_clock::now();
+        YOLOv8_Prediction ypred;
+        if (m_yolov8_onnx->runSync(imgTensor, static_cast<int>(m_counter), ypred)) {
+            double yolov8_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_yolo_start).count();
+            m_lastYOLOv8InferenceTimeMs = yolov8_ms;
+            if (logger) logger->info("\033[33m[TIMING] Frame {} | YOLOv8 (ONNX): {:.1f} ms\033[0m", m_counter, yolov8_ms);
+            if (m_yolov8Decoder != nullptr && ypred.objBoxBuff != nullptr) {
+                std::vector<std::vector<v8xyxy>> boxes;
+                m_yolov8Decoder->decodeBox(ypred.objBoxBuff, ypred.objConfBuff, ypred.objClsBuff,
+                    m_yolov8_onnx->getNumAnchorBox(), 0.25f, 0.5f, 1, boxes);
+                {
+                    std::lock_guard<std::mutex> lock(m_yolov8BoxesMutex);
+                    m_lastYOLOv8Boxes = std::move(boxes);
+                }
+                m_yolov8InputW = m_yolov8_onnx->getInputWidth();
+                m_yolov8InputH = m_yolov8_onnx->getInputHeight();
+                if (m_viewer != nullptr) {
+                    m_viewer->setYOLOv8ModelSize(m_yolov8InputW, m_yolov8InputH);
+                    m_viewer->setYOLOv8Boxes(&m_lastYOLOv8Boxes);
+                }
+                // 3D back-projection is done after runAfterPatchify() so we use the current frame's pose
+            }
+        }
+    } else
+#endif
+    if (m_yolov8 != nullptr) {
+        auto t_yolo_start = std::chrono::steady_clock::now();
+        YOLOv8_Prediction ypred;
+        if (m_yolov8->runSync(imgTensor, static_cast<int>(m_counter), ypred)) {
+            double yolov8_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_yolo_start).count();
+            m_lastYOLOv8InferenceTimeMs = yolov8_ms;
+            if (logger) logger->info("\033[33m[TIMING] Frame {} | YOLOv8: {:.1f} ms\033[0m", m_counter, yolov8_ms);
+            if (m_yolov8Decoder != nullptr && ypred.objBoxBuff != nullptr) {
+                std::vector<std::vector<v8xyxy>> boxes;
+                m_yolov8Decoder->decodeBox(ypred.objBoxBuff, ypred.objConfBuff, ypred.objClsBuff,
+                    m_yolov8->getNumAnchorBox(), 0.25f, 0.5f, 1, boxes);
+                {
+                    std::lock_guard<std::mutex> lock(m_yolov8BoxesMutex);
+                    m_lastYOLOv8Boxes = std::move(boxes);
+                }
+                m_yolov8InputW = m_yolov8->getInputWidth();
+                m_yolov8InputH = m_yolov8->getInputHeight();
+                if (m_viewer != nullptr) {
+                    m_viewer->setYOLOv8ModelSize(m_yolov8InputW, m_yolov8InputH);
+                    m_viewer->setYOLOv8Boxes(&m_lastYOLOv8Boxes);
+                }
+                // 3D back-projection is done after runAfterPatchify() so we use the current frame's pose
+            }
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(m_detections3DMutex);
+        m_lastDetections3D.clear();
+    }
+#endif
+
     // Call helper function to continue with rest of logic after patchifier.forward()
     // This avoids calling patchifier.forward() again
     runAfterPatchify(timestamp, intrinsics, H, W, n, n_use, pm, mm, M, P, patch_D, patches, clr, image_for_viewer);
-    
+
+    // Back-project 2D YOLOv8 boxes to 3D when EnableShow3DDetection = 1 (skip when disabled to save work)
+    if (m_enableShow3DDetection) {
+    std::vector<std::vector<v8xyxy>> boxes_copy;
+    {
+        std::lock_guard<std::mutex> lock(m_yolov8BoxesMutex);
+        boxes_copy = m_lastYOLOv8Boxes;
+    }
+    if (!boxes_copy.empty()) {
+            std::vector<Detection3D> det3d;
+            const SE3& T_wc = m_pg.m_poses[n_use];
+            // Use this frame's intrinsics (same as BA) so bbox-center reprojection matches patch pipeline.
+            // m_pg.m_intrinsics[n_use] are at 1/4 res; *4 gives intrinsics at (m_wd,m_ht); then scale to YOLOv8.
+            const float* intr = m_pg.m_intrinsics[n_use];
+            const float RES = 4.0f;
+            int yw = (m_yolov8InputW > 0) ? m_yolov8InputW : m_wd;
+            int yh = (m_yolov8InputH > 0) ? m_yolov8InputH : m_ht;
+            float scale_x = (m_wd > 0) ? (static_cast<float>(yw) / static_cast<float>(m_wd)) : 1.0f;
+            float scale_y = (m_ht > 0) ? (static_cast<float>(yh) / static_cast<float>(m_ht)) : 1.0f;
+            float fx = intr[0] * RES * scale_x, fy = intr[1] * RES * scale_y;
+            float cx = intr[2] * RES * scale_x, cy = intr[3] * RES * scale_y;
+            for (const auto& class_boxes : boxes_copy) {
+                for (const auto& b : class_boxes) {
+                    // Bbox center in pixel coords (horizontal and vertical) so each detection gets a distinct ray
+                    float u = (static_cast<float>(b.x1) + static_cast<float>(b.x2)) * 0.5f;
+                    float v = (static_cast<float>(b.y1) + static_cast<float>(b.y2)) * 0.5f;
+                    Vec3 pos;
+                    if (unprojectToGroundPlane(fx, fy, cx, cy, T_wc, u, v, &pos)) {
+                        det3d.push_back({pos, b.c, b.c_prob});
+                    }
+                }
+            }
+            std::lock_guard<std::mutex> lock(m_detections3DMutex);
+            m_lastDetections3D = std::move(det3d);
+            if (logger && !m_lastDetections3D.empty()) {
+                static bool logged_once = false;
+                if (!logged_once) {
+                    logged_once = true;
+                    logger->info("\033[33m[3D] Passing {} detection(s) to viewer (pedestrians/vehicles)\033[0m",
+                        static_cast<int>(m_lastDetections3D.size()));
+                }
+            }
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(m_detections3DMutex);
+        m_lastDetections3D.clear();
+    }
 }
 #endif
 
@@ -1488,23 +1642,18 @@ void DPVO::update()
             // Zero out m_net every N frames to prevent FP16 accumulation drift.
             // The Update model uses m_net as a feedback loop (net_out → next net_input).
             // On AMBA CV28 with FP16, tiny rounding errors accumulate over hundreds of frames,
-            // potentially causing pose divergence on long sequences (e.g., >750 frames).
+            // potentially causing pose divergence on long sequences (e.g., >1500 frames).
             // Resetting to zero is safe because new edges always start at zero (see addFactors),
             // and the model is designed to recover from a zero hidden state.
-            // 
-            // CRITICAL: If m_netResetInterval is 0 (disabled), use default interval of 500 frames
-            // to prevent drift after ~750 frames (as observed in practice).
-            int reset_interval = (m_netResetInterval > 0) ? m_netResetInterval : 500;
-            if (m_counter > 0 && (m_counter % reset_interval == 0)) {
+            if (m_netResetInterval > 0 && m_counter > 0 && (m_counter % m_netResetInterval == 0)) {
                 for (int e = 0; e < num_active; e++) {
                     for (int d = 0; d < NET_DIM; d++) {
                         m_pg.m_net[e][d] = 0.0f;
                     }
                 }
                 if (logger) {
-                    logger->warn("\033[33mDPVO::update [Frame {}]: 🔄 Reset m_net hidden state for {} active edges "
-                                "(interval={}, prevents FP16 drift after ~750 frames)\033[0m", 
-                                m_counter, num_active, reset_interval);
+                    logger->warn("DPVO::update [Frame {}]: 🔄 Reset m_net hidden state for {} active edges "
+                                "(interval={})", m_counter, num_active, m_netResetInterval);
                 }
             }
         } else {
@@ -3026,48 +3175,11 @@ void DPVO::reproject(
     // Jacobians are stored in output buffers if provided, otherwise discarded
 }
 
-void DPVO::reportImagePreprocessTime(int64_t frame_id, double ms)
-{
-    if (frame_id <= 0) return;
-    std::lock_guard<std::mutex> lock(m_frameTimingsMutex);
-    m_frameTimings[frame_id].image_ms = ms;
-}
 
-void DPVO::reportInferenceTime(int64_t frame_id, double ms)
-{
-    if (frame_id <= 0) return;
-    std::lock_guard<std::mutex> lock(m_frameTimingsMutex);
-    m_frameTimings[frame_id].inference_ms = ms;
-}
 
-void DPVO::_logAndClearPipelineTiming(int64_t frame_timestamp, double processing_ms,
-                                      const std::shared_ptr<spdlog::logger>& logger)
-{
-    std::lock_guard<std::mutex> tlock(m_frameTimingsMutex);
-    PerFrameTiming& t = m_frameTimings[frame_timestamp];
-    t.processing_ms = processing_ms;
-    double image_ms = (t.image_ms >= 0.0) ? t.image_ms : 0.0;
-    double inference_ms = (t.inference_ms >= 0.0) ? t.inference_ms : 0.0;
-    double max_ms = std::max({image_ms, inference_ms, processing_ms});
-    double pipeline_fps = (max_ms > 0.0) ? (1000.0 / max_ms) : 0.0;
-    double latency_ms = inference_ms + processing_ms;
-    double latency_fps = (latency_ms > 0.0) ? (1000.0 / latency_ms) : 0.0;
-    if (logger) {
-        logger->info("\033[33m[PIPELINE] Frame {} | Max (bottleneck): {:.2f} ms ({:.1f} FPS) [image: {:.2f} ms, inference: {:.2f} ms, processing: {:.2f} ms]\033[0m",
-                    frame_timestamp, max_ms, pipeline_fps, image_ms, inference_ms, processing_ms);
-        logger->info("\033[33m[PIPELINE] Frame {} | Latency (inference+processing, drives viewer): {:.2f} ms ({:.2f} FPS)\033[0m",
-                    frame_timestamp, latency_ms, latency_fps);
-    }
-    m_frameTimings.erase(frame_timestamp);
-    for (auto it = m_frameTimings.begin(); it != m_frameTimings.end(); ) {
-        if (it->first < frame_timestamp - 50) it = m_frameTimings.erase(it);
-        else ++it;
-    }
-}
 
 void DPVO::terminate() 
 {
-    stopInferenceThread();
     stopProcessingThread();
 }
 
@@ -3193,408 +3305,93 @@ static bool convertTensorToImage(ea_tensor_t* imgTensor, std::vector<uint8_t>& i
 // -------------------------------------------------------------
 // Threading interface (similar to wnc_app)
 // -------------------------------------------------------------
-
-// Inference Thread: Runs FNet/INet inference
-void DPVO::startInferenceThread()
-{
-    auto logger = spdlog::get("dpvo_inference");
-    if (!logger) {
-#ifdef SPDLOG_USE_SYSLOG
-        logger = spdlog::syslog_logger_mt("dpvo_inference", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
-#else
-        logger = spdlog::stdout_color_mt("dpvo_inference");
-        logger->set_pattern("[%n] [%^%l%$] %v");
-#endif
-    }
-    
-    m_inferenceThreadRunning = true;
-    m_inferenceThread = std::thread([this]() {
-        auto logger = spdlog::get("dpvo_inference");
-        if (!logger) {
-#ifdef SPDLOG_USE_SYSLOG
-            logger = spdlog::syslog_logger_mt("dpvo_inference", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
-#else
-            logger = spdlog::stdout_color_mt("dpvo_inference");
-            logger->set_pattern("[%n] [%^%l%$] %v");
-#endif
-        }
-        
-        if (logger) logger->info("Inference thread started");
-        
-        std::unique_lock<std::mutex> lock(m_inferenceQueueMutex);
-        while (m_inferenceThreadRunning)
-        {
-            m_inferenceQueueCV.wait_for(lock, std::chrono::milliseconds(1000), [this]() {
-                return !m_inferenceThreadRunning || !m_inputFrameQueue.empty();
-            });
-            if (!m_inferenceThreadRunning)
-                break;
-
-            if (!m_inputFrameQueue.empty())
-            {
-                InputFrame frame = std::move(m_inputFrameQueue.front());
-                m_inputFrameQueue.pop();
-                m_inferenceQueueCV.notify_one();
-                lock.unlock();
-                
-                try {
-                    // Assign monotonic timestamp (only inference thread writes m_nextInferenceTimestamp;
-                    // processing thread writes m_currentTimestamp from result.timestamp — avoids race)
-                    int64_t frame_timestamp = m_nextInferenceTimestamp++;
-                    
-                    if (logger) {
-                        logger->info("Inference thread: Processing frame timestamp={} (queue_size before pop={})", 
-                                    frame_timestamp, m_inputFrameQueue.size() + 1);
-                    }
-                    
-                    // Get model output dimensions
-                    int fmap_H = m_patchifier.getOutputHeight();
-                    int fmap_W = m_patchifier.getOutputWidth();
-                    const int inet_output_channels = 384;
-                    
-                    if (fmap_H == 0 || fmap_W == 0) {
-                        if (logger) logger->error("Inference thread: Invalid model output dimensions");
-                        lock.lock();
-                        continue;
-                    }
-                    
-                    // Allocate buffers for inference results
-                    InferenceResult result;
-                    result.timestamp = frame_timestamp;
-                    result.H = frame.H;
-                    result.W = frame.W;
-                    result.fmap_buffer.resize(128 * fmap_H * fmap_W);
-                    
-                    const int M = m_cfg.PATCHES_PER_FRAME;
-                    const int patch_radius = m_P / 2;
-                    const int patch_D = 2 * patch_radius + 1;
-                    const int patches_size = M * 3 * patch_D * patch_D;
-                    
-                    // Allocate buffers for patch features and patches
-                    result.imap_patches.resize(M * inet_output_channels);
-                    result.gmap_patches.resize(M * 128 * patch_D * patch_D);
-                    result.patches.resize(patches_size);
-                    result.clr.resize(M * 3);
-                    
-                    // Run FNet/INet inference using patchifier
-                    auto t_inference_start = std::chrono::steady_clock::now();
-                    
-                    if (logger) {
-                        logger->info("Inference thread: About to run FNet/INet inference for frame timestamp={}", 
-                                    frame_timestamp);
-                    }
-                    
-#if defined(CV28) || defined(CV28_SIMULATOR)
-                    if (frame.tensor_img != nullptr) {
-                        // Copy input tensor into our buffer so we can callback (drop resource) right after
-                        // inference without use-after-free; FNet/INet then run from our copy.
-                        const size_t* shape_src = ea_tensor_shape(frame.tensor_img);
-                        size_t pitch_src = ea_tensor_pitch(frame.tensor_img);
-                        size_t C = shape_src[EA_C], H = shape_src[EA_H], W = shape_src[EA_W];
-                        size_t copy_size = C * H * pitch_src;
-                        m_inferenceInputCopyBuffer.resize(copy_size);
-                        const uint8_t* src_data = static_cast<const uint8_t*>(ea_tensor_data(frame.tensor_img));
-                        if (src_data != nullptr) {
-                            for (size_t c = 0; c < C; c++) {
-                                for (size_t y = 0; y < H; y++) {
-                                    const uint8_t* row_src = src_data + (c * H + y) * pitch_src;
-                                    uint8_t* row_dst = m_inferenceInputCopyBuffer.data() + (c * H + y) * pitch_src;
-                                    memcpy(row_dst, row_src, pitch_src);
-                                }
-                            }
-                        }
-                        size_t shape_nchw[4] = { 1, C, H, W };
-                        ea_tensor_t* copy_tensor = ea_tensor_new_from_other_buffer(
-                            EA_MEM_HEAP, 0, EA_U8, shape_nchw, pitch_src,
-                            m_inferenceInputCopyBuffer.data(), 0);
-                        if (copy_tensor == nullptr) {
-                            if (logger) logger->error("Inference thread: ea_tensor_new_from_other_buffer failed");
-                            lock.lock();
-                            continue;
-                        }
-                        // Run FNet/INet from our copy (resource can be dropped after callback)
-                        m_patchifier.forward(
-                            copy_tensor,
-                            result.fmap_buffer.data(),
-                            result.imap_patches.data(),
-                            result.gmap_patches.data(),
-                            result.patches.data(),
-                            result.clr.data(),
-                            M
-                        );
-                        ea_tensor_free(copy_tensor);
-                        copy_tensor = nullptr;
-                        // Viewer image from original tensor (still valid until we callback)
-                        if (m_visualizationEnabled) {
-                            result.image_data.resize(frame.H * frame.W * 3);
-                            void* tensor_data = ea_tensor_data(frame.tensor_img);
-                            if (tensor_data != nullptr) {
-                                const uint8_t* src = static_cast<const uint8_t*>(tensor_data);
-                                memcpy(result.image_data.data(), src, frame.H * frame.W * 3);
-                                result.image_ptr = result.image_data.data();
-                            } else {
-                                result.image_ptr = nullptr;
-                            }
-                        } else {
-                            result.image_ptr = nullptr;
-                        }
-                        result.tensor_img = nullptr;
-                    } else {
-                        if (logger) logger->error("Inference thread: frame.tensor_img is nullptr!");
-                        lock.lock();
-                        continue;
-                    }
-#else
-                    // Non-CV28 builds not fully supported in split-thread mode
-                    if (logger) logger->warn("Inference thread: Non-CV28 build not fully supported");
-                    lock.lock();
-                    continue;
-#endif
-                    
-                    auto t_inference_end = std::chrono::steady_clock::now();
-                    double inference_ms = std::chrono::duration<double, std::milli>(t_inference_end - t_inference_start).count();
-                    double inference_fps = (inference_ms > 0.0) ? (1000.0 / inference_ms) : 0.0;
-                    reportInferenceTime(frame_timestamp, inference_ms);
-                    if (logger) {
-                        logger->info("\033[33m[INFERENCE_THREAD] Frame {} | FNet/INet inference: {:.2f} ms ({:.1f} FPS)\033[0m", 
-                                    frame_timestamp, inference_ms, inference_fps);
-                    }
-                    
-                    // Push result to processing thread queue
-                    {
-                        std::lock_guard<std::mutex> result_lock(m_inferenceResultMutex);
-                        m_inferenceResultQueue.push(std::move(result));
-                        if (logger) logger->debug("Inference thread: Pushed result to queue, queue_size={}", m_inferenceResultQueue.size());
-                    }
-                    m_inferenceResultCV.notify_one();
-
-                    // Notify image thread that we're done with this frame's tensor (safe to drop).
-                    // This allows the next frame to be pushed while the processing thread still
-                    // works on this frame, so inference and processing can run in parallel.
-                    if (m_frameProcessedCallback)
-                        m_frameProcessedCallback();
-                    
-                } catch (const std::exception& e) {
-                    if (logger) logger->error("Exception in inference thread: {}", e.what());
-                } catch (...) {
-                    if (logger) logger->error("Unknown exception in inference thread");
-                }
-                
-                lock.lock();
-            }
-        }
-        if (logger) logger->info("Inference thread terminated");
-    });
-}
-
-void DPVO::stopInferenceThread()
-{
-    {
-        std::lock_guard<std::mutex> lock(m_inferenceQueueMutex);
-        m_inferenceThreadRunning = false;
-    }
-    m_inferenceQueueCV.notify_one();
-    if (m_inferenceThread.joinable())
-        m_inferenceThread.join();
-}
-
-void DPVO::wakeInferenceThread()
-{
-    m_inferenceQueueCV.notify_one();
-}
-
-// Processing Thread: Processes inference results (patchify, reproject, correlation, update, BA)
 void DPVO::startProcessingThread()
 {
-    auto logger = spdlog::get("dpvo_processing");
+    // Initialize logger if it doesn't exist
+    auto logger = spdlog::get("dpvo");
     if (!logger) {
 #ifdef SPDLOG_USE_SYSLOG
-        logger = spdlog::syslog_logger_mt("dpvo_processing", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
 #else
-        logger = spdlog::stdout_color_mt("dpvo_processing");
+        logger = spdlog::stdout_color_mt("dpvo");
         logger->set_pattern("[%n] [%^%l%$] %v");
 #endif
     }
     
     m_processingThreadRunning = true;
     m_processingThread = std::thread([this]() {
-        auto logger = spdlog::get("dpvo_processing");
+        // Get or create logger in thread
+        auto logger = spdlog::get("dpvo");
         if (!logger) {
 #ifdef SPDLOG_USE_SYSLOG
-            logger = spdlog::syslog_logger_mt("dpvo_processing", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+            logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
 #else
-            logger = spdlog::stdout_color_mt("dpvo_processing");
+            logger = spdlog::stdout_color_mt("dpvo");
             logger->set_pattern("[%n] [%^%l%$] %v");
 #endif
         }
         
-        if (logger) logger->info("Processing thread started");
-        
-        std::unique_lock<std::mutex> lock(m_inferenceResultMutex);
+        std::unique_lock<std::mutex> lock(m_queueMutex);
         while (m_processingThreadRunning)
         {
-            m_inferenceResultCV.wait_for(lock, std::chrono::milliseconds(1000), [this]() {
-                return !m_processingThreadRunning || !m_inferenceResultQueue.empty();
+            m_queueCV.wait_for(lock, std::chrono::milliseconds(1000), [this]() {
+                return !m_processingThreadRunning || !m_inputFrameQueue.empty();
             });
             if (!m_processingThreadRunning)
                 break;
 
-            if (!m_inferenceResultQueue.empty())
+            if (!m_inputFrameQueue.empty())
             {
-                InferenceResult result = std::move(m_inferenceResultQueue.front());
-                m_inferenceResultQueue.pop();
+                InputFrame frame = std::move(m_inputFrameQueue.front());
+                m_inputFrameQueue.pop();
                 lock.unlock();
                 
                 m_bDone = false;
                 
                 try {
-                    if (logger) logger->info("Processing thread: Processing frame timestamp={}", result.timestamp);
+                    // Update timestamp (increment for each frame)
+                    m_currentTimestamp++;
                     
-                    // Time DPVO processing (patchify, reproject, correlation, update, BA)
-                    auto t_processing_start = std::chrono::steady_clock::now();
-                    
-                    // Process inference result: extract patches and run rest of DPVO pipeline
-                    processInferenceResult(result);
-                    
-                    auto t_processing_end = std::chrono::steady_clock::now();
-                    double processing_ms = std::chrono::duration<double, std::milli>(t_processing_end - t_processing_start).count();
-                    double processing_fps = (processing_ms > 0.0) ? (1000.0 / processing_ms) : 0.0;
-                    if (logger) {
-                        logger->info("\033[33m[DPVO_THREAD] Frame {} | DPVO processing (patchify, reproject, correlation, update, BA): {:.2f} ms ({:.1f} FPS)\033[0m", 
-                                    result.timestamp, processing_ms, processing_fps);
+                    // Call the main processing function (use member variables for intrinsics and timestamp)
+                    #if defined(CV28) || defined(CV28_SIMULATOR)
+                    // CV28 builds always use tensor
+                    if (frame.tensor_img != nullptr) {
+                        run(m_currentTimestamp, frame.tensor_img, m_intrinsics);
+                    } else {
+                        if (logger) logger->error("DPVO::startProcessingThread: frame.tensor_img is nullptr in CV28 build!");
                     }
-                    _logAndClearPipelineTiming(result.timestamp, processing_ms, logger);
-                
+#else
+                    // Non-CV28 builds use uint8_t* image
+                    run(m_currentTimestamp, frame.image.data(), m_intrinsics, frame.H, frame.W);
+#endif
                 } catch (const std::exception& e) {
-                    if (logger) logger->error("Exception in processing thread: {}", e.what());
+                    if (logger) logger->error("Exception in frame processing: {}", e.what());
                 } catch (...) {
-                    if (logger) logger->error("Unknown exception in processing thread");
+                    if (logger) logger->error("Unknown exception in frame processing");
                 }
                 
                 m_bDone = true;
-                // Frame-processed callback is invoked by inference thread (after push to result queue)
-                // so that the image thread can push the next frame sooner and inference/processing overlap.
                 lock.lock();
             }
         }
-        if (logger) logger->info("Processing thread terminated");
+        if (logger) logger->debug("startProcessingThread is terminated");
     });
 }
 
 void DPVO::stopProcessingThread()
 {
     {
-        std::lock_guard<std::mutex> lock(m_inferenceResultMutex);
+        std::lock_guard<std::mutex> lock(m_queueMutex);
         m_processingThreadRunning = false;
     }
-    m_inferenceResultCV.notify_one();
+    m_queueCV.notify_one();
     if (m_processingThread.joinable())
         m_processingThread.join();
 }
 
 void DPVO::wakeProcessingThread()
 {
-    m_inferenceResultCV.notify_one();
-}
-
-// Process inference results: copy to ring buffers and call runAfterPatchify()
-void DPVO::processInferenceResult(const InferenceResult& result)
-{
-    auto logger = spdlog::get("dpvo_processing");
-    if (!logger) {
-        logger = spdlog::get("dpvo");
-    }
-    
-    // Update timestamp
-    m_currentTimestamp = result.timestamp;
-    
-    // Validate and get n (same logic as run())
-    int n = 0;
-    if (m_pg.m_n < 0 || m_pg.m_n >= PatchGraph::N || m_pg.m_n > 999999) {
-        try {
-            m_pg.reset();
-            if (m_pg.m_n < 0 || m_pg.m_n >= PatchGraph::N || m_pg.m_n > 999999) {
-                m_pg.m_n = 0;
-                m_pg.m_m = 0;
-            }
-            n = m_pg.m_n;
-        } catch (...) {
-            n = 0;
-        }
-    } else {
-        n = m_pg.m_n;
-    }
-    
-    if (n + 1 >= PatchGraph::N) {
-        if (logger) {
-            logger->error("DPVO::processInferenceResult: PatchGraph buffer overflow - n={}, buffer_size={}", 
-                          n, PatchGraph::N);
-        }
-        throw std::runtime_error("PatchGraph buffer overflow");
-    }
-    
-    const int pm = n % m_pmem;  // Ring buffer index for imap/gmap
-    const int mm = n % m_mem;   // Ring buffer index for fmap1/fmap2
-    const int M  = m_cfg.PATCHES_PER_FRAME;
-    const int P  = m_P;
-    const int patch_radius = m_P / 2;
-    const int patch_D = 2 * patch_radius + 1;
-    
-    // Set up ring buffer pointers
-    m_cur_imap  = &m_imap[imap_idx(pm, 0, 0)];
-    m_cur_gmap  = &m_gmap[gmap_idx(pm, 0, 0, 0, 0)];
-    m_cur_fmap1 = &m_fmap1[fmap1_idx(0, mm, 0, 0, 0)];
-    
-    // Copy fmap_buffer to ring buffer
-    int fmap_H = m_patchifier.getOutputHeight();
-    int fmap_W = m_patchifier.getOutputWidth();
-    if (fmap_H > 0 && fmap_W > 0) {
-        std::memcpy(m_cur_fmap1, result.fmap_buffer.data(), 128 * fmap_H * fmap_W * sizeof(float));
-    }
-    
-    // Copy imap_patches to ring buffer
-    // Validate buffer sizes match
-    size_t expected_imap_size = static_cast<size_t>(M) * static_cast<size_t>(m_DIM);
-    if (result.imap_patches.size() != expected_imap_size) {
-        if (logger) logger->error("DPVO::processInferenceResult: imap_patches size mismatch! Expected {}, got {}", 
-                                  expected_imap_size, result.imap_patches.size());
-        throw std::runtime_error("imap_patches size mismatch");
-    }
-    std::memcpy(m_cur_imap, result.imap_patches.data(), expected_imap_size * sizeof(float));
-    
-    // Copy gmap_patches to ring buffer
-    size_t expected_gmap_size = static_cast<size_t>(M) * 128 * static_cast<size_t>(patch_D) * static_cast<size_t>(patch_D);
-    if (result.gmap_patches.size() != expected_gmap_size) {
-        if (logger) logger->error("DPVO::processInferenceResult: gmap_patches size mismatch! Expected {}, got {}", 
-                                  expected_gmap_size, result.gmap_patches.size());
-        throw std::runtime_error("gmap_patches size mismatch");
-    }
-    std::memcpy(m_cur_gmap, result.gmap_patches.data(), expected_gmap_size * sizeof(float));
-    
-    // Validate n_use
-    int n_use = n;
-    if (n_use < 0 || n_use >= PatchGraph::N || n_use > 99999) {
-        if (logger) logger->warn("DPVO::processInferenceResult: n={} is corrupted! Using n_use=0 instead.", n);
-        n_use = 0;
-    }
-    
-    // Call runAfterPatchify() with the pre-computed patches
-    runAfterPatchify(
-        result.timestamp,
-        m_intrinsics,
-        result.H,
-        result.W,
-        n,
-        n_use,
-        pm,
-        mm,
-        M,
-        P,
-        patch_D,
-        const_cast<float*>(result.patches.data()),  // runAfterPatchify doesn't modify, but signature requires non-const
-        const_cast<uint8_t*>(result.clr.data()),     // Same here
-        result.image_ptr
-    );
+    m_queueCV.notify_one();
 }
 
 #if defined(CV28) || defined(CV28_SIMULATOR)
@@ -3632,20 +3429,24 @@ void DPVO::updateInput(ea_tensor_t* imgTensor)
     // Initialize image vector (empty, not used when tensor is available)
     frame.image.clear();
     
-    if (logger) logger->info("updateInput: Tensor stored, H={}, W={}", frame.H, frame.W);
+    if (logger) logger->debug("updateInput: Tensor stored, H={}, W={}", frame.H, frame.W);
     
-    const size_t MAX_QUEUE_SIZE = 10;
-    std::unique_lock<std::mutex> lock(m_inferenceQueueMutex);
-    while (m_inputFrameQueue.size() >= MAX_QUEUE_SIZE)
-        m_inferenceQueueCV.wait(lock);
-    size_t queue_size_before = m_inputFrameQueue.size();
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    
     m_inputFrameQueue.push(std::move(frame));
-    if (logger) {
-        logger->info("updateInput: Frame added to input queue, queue_size: {} -> {} (H={}, W={})",
-                    queue_size_before, m_inputFrameQueue.size(), frame.H, frame.W);
+    
+    if (logger) logger->debug("updateInput: Frame added to queue, queue_size={}", m_inputFrameQueue.size());
+    
+    // Limit queue size to prevent memory issues
+    const size_t MAX_QUEUE_SIZE = 10;
+    while (m_inputFrameQueue.size() > MAX_QUEUE_SIZE)
+    {
+        m_inputFrameQueue.pop();
     }
-    m_inferenceQueueCV.notify_one();
-    if (logger) logger->debug("updateInput: Finished, notified inference thread");
+    
+    wakeProcessingThread();
+    
+    if (logger) logger->debug("updateInput: Finished, notified processing thread");
 }
 
 void DPVO::addFrame(ea_tensor_t* imgTensor)
@@ -3659,7 +3460,7 @@ void DPVO::updateInput(const uint8_t* image, int H, int W)
     if (image == nullptr)
         return;
         
-    std::lock_guard<std::mutex> lock(m_inferenceQueueMutex);
+    std::lock_guard<std::mutex> lock(m_queueMutex);
     
     InputFrame frame;
     frame.image.assign(image, image + H * W * 3);  // Copy image data (assuming RGB)
@@ -3669,13 +3470,6 @@ void DPVO::updateInput(const uint8_t* image, int H, int W)
     m_inputFrameQueue.push(std::move(frame));
     
     // Limit queue size to prevent memory issues
-    const size_t MAX_QUEUE_SIZE = 10;
-    while (m_inputFrameQueue.size() > MAX_QUEUE_SIZE)
-    {
-        m_inputFrameQueue.pop();
-    }
-    
-    m_inferenceQueueCV.notify_one();
     const size_t MAX_QUEUE_SIZE = 10;
     while (m_inputFrameQueue.size() > MAX_QUEUE_SIZE)
     {
@@ -3693,16 +3487,13 @@ void DPVO::addFrame(const uint8_t* image, int H, int W)
 
 bool DPVO::_hasWorkToDo()
 {
-    std::lock_guard<std::mutex> inference_lock(m_inferenceQueueMutex);
-    std::lock_guard<std::mutex> result_lock(m_inferenceResultMutex);
-    return !m_inputFrameQueue.empty() || !m_inferenceResultQueue.empty();
+    return !m_inputFrameQueue.empty();
 }
 
 bool DPVO::isProcessingComplete()
 {
-    std::lock_guard<std::mutex> inference_lock(m_inferenceQueueMutex);
-    std::lock_guard<std::mutex> result_lock(m_inferenceResultMutex);
-    return m_inputFrameQueue.empty() && m_inferenceResultQueue.empty() && m_bDone;
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    return m_inputFrameQueue.empty() && m_bDone;
 }
 
 // -------------------------------------------------------------
@@ -4164,6 +3955,15 @@ void DPVO::updateViewer()
             // The sync mechanism ensures frames in the sliding window have the latest optimized poses
             // Frames removed from the sliding window retain their last optimized pose (synced before removal)
             m_viewer->updatePoses(m_allPoses.data(), num_historical_frames);
+#if defined(CV28) || defined(CV28_SIMULATOR)
+            // Only pass 3D detections to viewer when EnableShow3DDetection = 1 in app_config.txt
+            if (m_enableShow3DDetection) {
+                std::lock_guard<std::mutex> lock(m_detections3DMutex);
+                m_viewer->setDetections3D(m_lastDetections3D);
+            } else {
+                m_viewer->setDetections3D(std::vector<Detection3D>{});
+            }
+#endif
             if (logger && m_pg.m_n > 0) {
                 // Log first and last pose to track movement
                 // Also check if poses are identity and if poses are changing

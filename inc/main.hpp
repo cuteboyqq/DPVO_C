@@ -30,6 +30,8 @@
 
 #include <queue>
 #include <mutex>
+#include <chrono>
+#include <unordered_map>
 #include "config_reader.hpp"
 #include "dpvo.hpp"
 #include "fnet.hpp"  // FNetInference
@@ -140,22 +142,28 @@ std::mutex queueMutex;
 std::condition_variable frameCondVar;
 std::atomic<bool> terminateThreads(false);
 
+// Per-frame DPVO timing information (measured in DPVO worker thread)
+struct DPVOTimingInfo {
+	std::chrono::steady_clock::time_point dpvo_start;
+	std::chrono::steady_clock::time_point dpvo_end;
+};
+
+extern std::mutex g_dpvoTimingMutex;
+extern std::unordered_map<unsigned int, DPVOTimingInfo> g_dpvoTimingMap;
+
 
 //
 void appDPVOthreadFunction(DPVO& dpvo);
 void processDPVOInput(
-	const std::string& inputPath,
+	const std::string& inputPath, 
 	const InputType& inputType,
-	std::shared_ptr<spdlog::logger> logger,
-	unsigned int& count,
+	std::shared_ptr<spdlog::logger> logger, 
+	unsigned int& count, 
 	global_param_t* G_param,
 	DPVO* dpvo,
 	int modelH,
 	int modelW,
-	Config_S* config,
-	std::mutex* frameProcessedMutex = nullptr,
-	std::condition_variable* frameProcessedCV = nullptr,
-	bool* frameProcessed = nullptr);
+	Config_S* config);
 void processDPVOApp(
 	const std::string& inputPath,
 	const InputType& inputType,

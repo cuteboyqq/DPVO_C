@@ -325,13 +325,11 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
     m_bProcessed = false;
 
     // STEP 1: load input tensors
-    if (logger) logger->info("DPVOUpdate::_run: About to call _loadInput...");
     if (!_loadInput(netData, inpData, corrData, iiData, jjData, kkData))
     {
         if (logger) logger->error("DPVOUpdate::_run: _loadInput failed");
         return false;
     }
-    if (logger) logger->info("DPVOUpdate::_run: _loadInput completed successfully, about to run inference...");
 
     // STEP 2: run inference using Ambarella's eazyai library
     {
@@ -642,27 +640,6 @@ bool DPVOUpdate::_loadInput(float *netData, float *inpData, float *corrData,
     }
     
     // Copy input data to working buffers
-    // CRITICAL: Validate pointers before memcpy to prevent crashes
-    if (netData == nullptr || inpData == nullptr || corrData == nullptr ||
-        iiData == nullptr || jjData == nullptr || kkData == nullptr) {
-        if (logger) logger->error("DPVOUpdate::_loadInput: One or more input data pointers are null");
-        return false;
-    }
-    
-    // Validate buffer sizes are positive
-    if (m_netBufferSize == 0 || m_inpBufferSize == 0 || m_corrBufferSize == 0 ||
-        m_iiBufferSize == 0 || m_jjBufferSize == 0 || m_kkBufferSize == 0) {
-        if (logger) logger->error("DPVOUpdate::_loadInput: One or more buffer sizes are zero");
-        return false;
-    }
-    
-    // Validate buffers are allocated
-    if (m_netBuff == nullptr || m_inpBuff == nullptr || m_corrBuff == nullptr ||
-        m_iiBuff == nullptr || m_jjBuff == nullptr || m_kkBuff == nullptr) {
-        if (logger) logger->error("DPVOUpdate::_loadInput: One or more working buffers are null");
-        return false;
-    }
-    
     std::memcpy(m_netBuff, netData, m_netBufferSize * sizeof(float));
     std::memcpy(m_inpBuff, inpData, m_inpBufferSize * sizeof(float));
     std::memcpy(m_corrBuff, corrData, m_corrBufferSize * sizeof(float));
@@ -777,105 +754,29 @@ bool DPVOUpdate::_loadInput(float *netData, float *inpData, float *corrData,
     {
         // Helper lambda: pitch-aware copy from dense buffer → ea_tensor (NCHW)
         auto pitchAwareCopyToTensor = [&logger](ea_tensor_t* tensor, const float* src, size_t expected_size, const char* name) {
-            if (tensor == nullptr) {
-                if (logger) logger->error("DPVOUpdate::_loadInput: {} tensor is nullptr!", name);
-                return;
-            }
-            
-            if (src == nullptr) {
-                if (logger) logger->error("DPVOUpdate::_loadInput: {} source buffer is nullptr!", name);
-                return;
-            }
-            
             const size_t* shape = ea_tensor_shape(tensor);
-            if (shape == nullptr) {
-                if (logger) logger->error("DPVOUpdate::_loadInput: {} tensor shape is nullptr!", name);
-                return;
-            }
-            
             int C = static_cast<int>(shape[EA_C]);
             int H = static_cast<int>(shape[EA_H]);
             int W = static_cast<int>(shape[EA_W]);
-            
-            // Validate dimensions
-            if (C <= 0 || H <= 0 || W <= 0) {
-                if (logger) logger->error("DPVOUpdate::_loadInput: {} tensor has invalid dimensions: C={}, H={}, W={}", 
-                                         name, C, H, W);
-                return;
-            }
-            
             size_t pitch_bytes = ea_tensor_pitch(tensor);
             size_t pitch_floats = pitch_bytes / sizeof(float);
             float* dst = static_cast<float*>(ea_tensor_data(tensor));
-            
-            if (dst == nullptr) {
-                if (logger) logger->error("DPVOUpdate::_loadInput: {} tensor data pointer is nullptr!", name);
-                return;
-            }
             
             if (logger) {
                 logger->info("DPVOUpdate::_loadInput: {} tensor shape=[{},{},{}], pitch={} bytes ({} floats), W={}",
                              name, C, H, W, pitch_bytes, pitch_floats, W);
             }
             
-            // Calculate actual size needed
-            size_t actual_size = static_cast<size_t>(C) * static_cast<size_t>(H) * static_cast<size_t>(W);
-            if (expected_size != actual_size) {
-                if (logger) logger->warn("DPVOUpdate::_loadInput: {} size mismatch! Expected {}, actual {}", 
-                                        name, expected_size, actual_size);
-            }
-            
             if (pitch_floats == static_cast<size_t>(W)) {
                 // No padding — fast path: direct memcpy
-                size_t copy_size = std::min(expected_size, actual_size);
-                std::memcpy(dst, src, copy_size * sizeof(float));
+                std::memcpy(dst, src, expected_size * sizeof(float));
             } else {
                 // Pitch-aware copy: write W elements per row, skip padding
-                size_t max_c = static_cast<size_t>(C);
-                size_t max_h = static_cast<size_t>(H);
-                size_t max_w = static_cast<size_t>(W);
-                
-                // Validate we don't exceed source buffer
-                size_t src_elements = expected_size;
-                size_t needed_elements = max_c * max_h * max_w;
-                if (src_elements < needed_elements) {
-                    if (logger) logger->error("DPVOUpdate::_loadInput: {} source buffer too small! Have {}, need {}", 
-                                             name, src_elements, needed_elements);
-                    return;
-                }
-                
-                // Calculate total tensor buffer size (in floats)
-                // Tensor layout: [C, H, W] with pitch, so total size is C * H * pitch_floats
-                size_t tensor_buffer_size = static_cast<size_t>(C) * static_cast<size_t>(H) * pitch_floats;
-                
                 for (int c = 0; c < C; c++) {
                     for (int h = 0; h < H; h++) {
-                        size_t tensor_row = static_cast<size_t>(c) * max_h * pitch_floats
+                        size_t tensor_row = static_cast<size_t>(c) * H * pitch_floats
                                           + static_cast<size_t>(h) * pitch_floats;
-                        size_t src_row = static_cast<size_t>(c) * max_h * max_w + static_cast<size_t>(h) * max_w;
-                        
-                        // Validate tensor write bounds: ensure we don't write past end of tensor buffer
-                        // We write W floats starting at tensor_row, so last element is at tensor_row + W - 1
-                        if (tensor_row + max_w > tensor_buffer_size) {
-                            if (logger) {
-                                logger->error("DPVOUpdate::_loadInput: {} tensor write out of bounds! "
-                                             "c={}, h={}, tensor_row={}, W={}, buffer_size={}", 
-                                             name, c, h, tensor_row, max_w, tensor_buffer_size);
-                            }
-                            return;
-                        }
-                        
-                        // Validate source read bounds: ensure we don't read past end of source buffer
-                        if (src_row + max_w > src_elements) {
-                            if (logger) {
-                                logger->error("DPVOUpdate::_loadInput: {} source read out of bounds! "
-                                             "c={}, h={}, src_row={}, W={}, buffer_size={}", 
-                                             name, c, h, src_row, max_w, src_elements);
-                            }
-                            return;
-                        }
-                        
-                        // Safe to copy W elements
+                        int src_row = c * H * W + h * W;
                         for (int w = 0; w < W; w++) {
                             dst[tensor_row + w] = src[src_row + w];
                         }
@@ -884,132 +785,22 @@ bool DPVOUpdate::_loadInput(float *netData, float *inpData, float *corrData,
             }
         };
         
-        // Validate buffer sizes match tensor dimensions before copying
-        const size_t* net_shape = ea_tensor_shape(m_inputNetTensor);
-        const size_t* inp_shape = ea_tensor_shape(m_inputInpTensor);
-        const size_t* corr_shape = ea_tensor_shape(m_inputCorrTensor);
-        const size_t* ii_shape = ea_tensor_shape(m_inputIiTensor);
-        const size_t* jj_shape = ea_tensor_shape(m_inputJjTensor);
-        const size_t* kk_shape = ea_tensor_shape(m_inputKkTensor);
-        
-        if (net_shape && inp_shape && corr_shape && ii_shape && jj_shape && kk_shape) {
-            size_t net_expected = net_shape[EA_C] * net_shape[EA_H] * net_shape[EA_W];
-            size_t inp_expected = inp_shape[EA_C] * inp_shape[EA_H] * inp_shape[EA_W];
-            size_t corr_expected = corr_shape[EA_C] * corr_shape[EA_H] * corr_shape[EA_W];
-            size_t ii_expected = ii_shape[EA_C] * ii_shape[EA_H] * ii_shape[EA_W];
-            size_t jj_expected = jj_shape[EA_C] * jj_shape[EA_H] * jj_shape[EA_W];
-            size_t kk_expected = kk_shape[EA_C] * kk_shape[EA_H] * kk_shape[EA_W];
-            
-            if (logger) {
-                if (m_netBufferSize != net_expected) {
-                    logger->warn("DPVOUpdate::_loadInput: net buffer size mismatch! Buffer={}, Tensor={}", 
-                                m_netBufferSize, net_expected);
-                }
-                if (m_inpBufferSize != inp_expected) {
-                    logger->warn("DPVOUpdate::_loadInput: inp buffer size mismatch! Buffer={}, Tensor={}", 
-                                m_inpBufferSize, inp_expected);
-                }
-                if (m_corrBufferSize != corr_expected) {
-                    logger->warn("DPVOUpdate::_loadInput: corr buffer size mismatch! Buffer={}, Tensor={}", 
-                                m_corrBufferSize, corr_expected);
-                }
-                if (m_iiBufferSize != ii_expected) {
-                    logger->warn("DPVOUpdate::_loadInput: ii buffer size mismatch! Buffer={}, Tensor={}", 
-                                m_iiBufferSize, ii_expected);
-                }
-                if (m_jjBufferSize != jj_expected) {
-                    logger->warn("DPVOUpdate::_loadInput: jj buffer size mismatch! Buffer={}, Tensor={}", 
-                                m_jjBufferSize, jj_expected);
-                }
-                if (m_kkBufferSize != kk_expected) {
-                    logger->warn("DPVOUpdate::_loadInput: kk buffer size mismatch! Buffer={}, Tensor={}", 
-                                m_kkBufferSize, kk_expected);
-                }
-            }
-        }
-        
-        // Copy data to tensors with error handling
-        try {
-            if (logger) logger->info("DPVOUpdate::_loadInput: Starting tensor copies...");
-            pitchAwareCopyToTensor(m_inputNetTensor,  m_netBuff,  m_netBufferSize,  "net");
-            if (logger) logger->info("DPVOUpdate::_loadInput: net tensor copy completed");
-            
-            pitchAwareCopyToTensor(m_inputInpTensor,  m_inpBuff,  m_inpBufferSize,  "inp");
-            if (logger) logger->info("DPVOUpdate::_loadInput: inp tensor copy completed");
-            
-            pitchAwareCopyToTensor(m_inputCorrTensor, m_corrBuff, m_corrBufferSize, "corr");
-            if (logger) logger->info("DPVOUpdate::_loadInput: corr tensor copy completed");
-            
-            pitchAwareCopyToTensor(m_inputIiTensor,   m_iiBuff,   m_iiBufferSize,   "ii");
-            if (logger) logger->info("DPVOUpdate::_loadInput: ii tensor copy completed");
-            
-            pitchAwareCopyToTensor(m_inputJjTensor,   m_jjBuff,   m_jjBufferSize,   "jj");
-            if (logger) logger->info("DPVOUpdate::_loadInput: jj tensor copy completed");
-            
-            pitchAwareCopyToTensor(m_inputKkTensor,   m_kkBuff,   m_kkBufferSize,   "kk");
-            if (logger) logger->info("DPVOUpdate::_loadInput: kk tensor copy completed");
-        } catch (const std::exception& e) {
-            if (logger) logger->error("DPVOUpdate::_loadInput: Exception during tensor copy: {}", e.what());
-            return false;
-        } catch (...) {
-            if (logger) logger->error("DPVOUpdate::_loadInput: Unknown exception during tensor copy");
-            return false;
-        }
+        pitchAwareCopyToTensor(m_inputNetTensor,  m_netBuff,  m_netBufferSize,  "net");
+        pitchAwareCopyToTensor(m_inputInpTensor,  m_inpBuff,  m_inpBufferSize,  "inp");
+        pitchAwareCopyToTensor(m_inputCorrTensor, m_corrBuff, m_corrBufferSize, "corr");
+        pitchAwareCopyToTensor(m_inputIiTensor,   m_iiBuff,   m_iiBufferSize,   "ii");
+        pitchAwareCopyToTensor(m_inputJjTensor,   m_jjBuff,   m_jjBufferSize,   "jj");
+        pitchAwareCopyToTensor(m_inputKkTensor,   m_kkBuff,   m_kkBufferSize,   "kk");
     }
     
     // Sync input tensors from CPU to VP (required when using ea_tensor_data instead of ea_tensor_data_for_write)
-#if defined(CV28) || defined(CV28_SIMULATOR)
-    try {
-        if (logger) logger->info("DPVOUpdate::_loadInput: Syncing tensors to VP...");
-        
-        // Validate tensors before syncing
-        if (m_inputNetTensor == nullptr || m_inputInpTensor == nullptr || m_inputCorrTensor == nullptr ||
-            m_inputIiTensor == nullptr || m_inputJjTensor == nullptr || m_inputKkTensor == nullptr) {
-            if (logger) logger->error("DPVOUpdate::_loadInput: One or more tensors are null before sync");
-            return false;
-        }
-        
-        // Validate tensor data pointers are still valid (check after copy operations)
-        void* net_data_check = ea_tensor_data(m_inputNetTensor);
-        void* inp_data_check = ea_tensor_data(m_inputInpTensor);
-        void* corr_data_check = ea_tensor_data(m_inputCorrTensor);
-        if (net_data_check == nullptr || inp_data_check == nullptr || corr_data_check == nullptr) {
-            if (logger) logger->error("DPVOUpdate::_loadInput: Tensor data pointers became invalid after copy!");
-            return false;
-        }
-        
-        if (logger) logger->info("DPVOUpdate::_loadInput: Syncing net tensor...");
-        ea_tensor_sync_cache(m_inputNetTensor, EA_CPU, EA_VP);
-        if (logger) logger->info("DPVOUpdate::_loadInput: net tensor sync completed");
-        
-        if (logger) logger->info("DPVOUpdate::_loadInput: Syncing inp tensor...");
-        ea_tensor_sync_cache(m_inputInpTensor, EA_CPU, EA_VP);
-        if (logger) logger->info("DPVOUpdate::_loadInput: inp tensor sync completed");
-        
-        if (logger) logger->info("DPVOUpdate::_loadInput: Syncing corr tensor...");
-        ea_tensor_sync_cache(m_inputCorrTensor, EA_CPU, EA_VP);
-        if (logger) logger->info("DPVOUpdate::_loadInput: corr tensor sync completed");
-        
-        if (logger) logger->info("DPVOUpdate::_loadInput: Syncing ii tensor...");
-        ea_tensor_sync_cache(m_inputIiTensor, EA_CPU, EA_VP);
-        if (logger) logger->info("DPVOUpdate::_loadInput: ii tensor sync completed");
-        
-        if (logger) logger->info("DPVOUpdate::_loadInput: Syncing jj tensor...");
-        ea_tensor_sync_cache(m_inputJjTensor, EA_CPU, EA_VP);
-        if (logger) logger->info("DPVOUpdate::_loadInput: jj tensor sync completed");
-        
-        if (logger) logger->info("DPVOUpdate::_loadInput: Syncing kk tensor...");
-        ea_tensor_sync_cache(m_inputKkTensor, EA_CPU, EA_VP);
-        if (logger) logger->info("DPVOUpdate::_loadInput: kk tensor sync completed");
-        
-        if (logger) logger->info("DPVOUpdate::_loadInput: All tensor syncs completed successfully");
-    } catch (const std::exception& e) {
-        if (logger) logger->error("DPVOUpdate::_loadInput: Exception during tensor sync: {}", e.what());
-        return false;
-    } catch (...) {
-        if (logger) logger->error("DPVOUpdate::_loadInput: Unknown exception during tensor sync");
-        return false;
-    }
+#if defined(CV28)
+    ea_tensor_sync_cache(m_inputNetTensor, EA_CPU, EA_VP);
+    ea_tensor_sync_cache(m_inputInpTensor, EA_CPU, EA_VP);
+    ea_tensor_sync_cache(m_inputCorrTensor, EA_CPU, EA_VP);
+    ea_tensor_sync_cache(m_inputIiTensor, EA_CPU, EA_VP);
+    ea_tensor_sync_cache(m_inputJjTensor, EA_CPU, EA_VP);
+    ea_tensor_sync_cache(m_inputKkTensor, EA_CPU, EA_VP);
 #endif
 #endif
 

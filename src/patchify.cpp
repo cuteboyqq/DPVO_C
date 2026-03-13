@@ -261,12 +261,41 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
     printf("[Patchifier] patchify_cpu_safe (patches) completed\n");
     fflush(stdout);
     
-    // Save patchify outputs (coords, gmap, imap, patches) for TARGET_FRAME when enabled
+    // Save patchify outputs (coords, gmap, imap, patches) for a specific frame
+    // TARGET_FRAME is now defined in target_frame.hpp (shared across all files)
     static int patchify_frame_counter = 0;
     patchify_frame_counter++;
-    int current_patchify_frame = patchify_frame_counter - 1;  // 0-indexed
+    int current_patchify_frame = patchify_frame_counter - 1;  // 0-indexed frame number
+    
     if (TARGET_FRAME >= 0 && current_patchify_frame == TARGET_FRAME) {
-        _savePatchifyResultsToBinFiles(current_patchify_frame, coords, gmap, imap, patches, M, inet_output_channels);
+        // Get logger for file I/O operations
+        auto logger_patch = spdlog::get("fnet");
+        if (!logger_patch) {
+            logger_patch = spdlog::get("inet");
+        }
+        
+        std::string frame_suffix = std::to_string(TARGET_FRAME);
+        
+        // Save coordinates
+        std::string coords_filename = get_bin_file_path("cpp_coords_frame" + frame_suffix + ".bin");
+        patchify_file_io::save_coordinates(coords_filename, coords, M, logger_patch);
+        
+        // Save gmap: [M, 128, P, P] = [4, 128, 3, 3]
+        std::string gmap_filename = get_bin_file_path("cpp_gmap_frame" + frame_suffix + ".bin");
+        patchify_file_io::save_patch_data(gmap_filename, gmap, M, 128, m_patch_size, logger_patch, "gmap");
+        
+        // Save imap: [M, 384, 1, 1] = [4, 384, 1, 1]
+        std::string imap_filename = get_bin_file_path("cpp_imap_frame" + frame_suffix + ".bin");
+        patchify_file_io::save_patch_data_hw(imap_filename, imap, M, inet_output_channels, 1, 1, logger_patch, "imap");
+        
+        // Save patches: [M, 3, P, P] = [4, 3, 3, 3]
+        std::string patches_filename = get_bin_file_path("cpp_patches_frame" + frame_suffix + ".bin");
+        patchify_file_io::save_patch_data(patches_filename, patches, M, 3, m_patch_size, logger_patch, "patches");
+        
+        if (logger_patch) {
+            logger_patch->info("[Patchifier] Saved patchify outputs for frame {}: {}, {}, {}, {}", 
+                              current_patchify_frame, coords_filename, gmap_filename, imap_filename, patches_filename);
+        }
     }
 
     printf("[Patchifier] About to extract colors\n");
@@ -307,33 +336,6 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
     }
     printf("[Patchifier] Colors extracted\n");
     fflush(stdout);
-}
-
-void Patchifier::_savePatchifyResultsToBinFiles(int frame_index, const float* coords, const float* gmap,
-                                                 const float* imap, const float* patches, int M,
-                                                 int inet_output_channels)
-{
-    auto logger_patch = spdlog::get("fnet");
-    if (!logger_patch) logger_patch = spdlog::get("inet");
-
-    std::string frame_suffix = std::to_string(frame_index);
-
-    std::string coords_filename = get_bin_file_path("cpp_coords_frame" + frame_suffix + ".bin");
-    patchify_file_io::save_coordinates(coords_filename, coords, M, logger_patch);
-
-    std::string gmap_filename = get_bin_file_path("cpp_gmap_frame" + frame_suffix + ".bin");
-    patchify_file_io::save_patch_data(gmap_filename, gmap, M, 128, m_patch_size, logger_patch, "gmap");
-
-    std::string imap_filename = get_bin_file_path("cpp_imap_frame" + frame_suffix + ".bin");
-    patchify_file_io::save_patch_data_hw(imap_filename, imap, M, inet_output_channels, 1, 1, logger_patch, "imap");
-
-    std::string patches_filename = get_bin_file_path("cpp_patches_frame" + frame_suffix + ".bin");
-    patchify_file_io::save_patch_data(patches_filename, patches, M, 3, m_patch_size, logger_patch, "patches");
-
-    if (logger_patch) {
-        logger_patch->info("[Patchifier] Saved patchify outputs for frame {}: {}, {}, {}, {}",
-                           frame_index, coords_filename, gmap_filename, imap_filename, patches_filename);
-    }
 }
 
 #if defined(CV28) || defined(CV28_SIMULATOR)
@@ -628,49 +630,20 @@ void Patchifier::_saveAmbaOutputsForComparison(
     patchify_file_io::save_model_output(inet_fn, m_imap_buffer.data(),
                                         inet_C, inet_H, inet_W, logger, "amba_inet");
 
-    // 3. Save raw input image from tensor for Python (pitch-aware → dense HWC)
-    //    AMBA tensor is NCHW with pitch; writing raw_data without pitch would mix in padding
-    //    and give wrong pixels after the first row. Copy with pitch then write dense HWC.
+    // 3. Save raw input image from tensor for Python to use the same input
     const size_t* img_shape = ea_tensor_shape(imgTensor);
     void* raw_data = ea_tensor_data(imgTensor);
     if (raw_data && img_shape) {
         int img_H = static_cast<int>(img_shape[EA_H]);
         int img_W = static_cast<int>(img_shape[EA_W]);
         int img_C = static_cast<int>(img_shape[EA_C]);
-        size_t pitch = ea_tensor_pitch(imgTensor);
-        size_t pitch_elem = pitch / sizeof(uint8_t);
-        const uint8_t* src = static_cast<const uint8_t*>(raw_data);
-        std::vector<uint8_t> dense_hwc(static_cast<size_t>(img_H) * img_W * img_C);
-        // NCHW with pitch: copy to dense (C,H,W) then to HWC
-        if (pitch_elem == static_cast<size_t>(img_W)) {
-            // Contiguous: copy NCHW → HWC
-            for (int y = 0; y < img_H; y++) {
-                for (int x = 0; x < img_W; x++) {
-                    for (int c = 0; c < img_C; c++) {
-                        size_t src_idx = static_cast<size_t>(c) * img_H * img_W + static_cast<size_t>(y) * img_W + x;
-                        size_t dst_idx = static_cast<size_t>(y) * img_W * img_C + static_cast<size_t>(x) * img_C + c;
-                        dense_hwc[dst_idx] = src[src_idx];
-                    }
-                }
-            }
-        } else {
-            // Pitch-aware: each channel row has pitch_elem elements
-            for (int c = 0; c < img_C; c++) {
-                for (int y = 0; y < img_H; y++) {
-                    const uint8_t* row = src + (static_cast<size_t>(c) * img_H + y) * pitch_elem;
-                    for (int x = 0; x < img_W; x++) {
-                        size_t dst_idx = static_cast<size_t>(y) * img_W * img_C + static_cast<size_t>(x) * img_C + c;
-                        dense_hwc[dst_idx] = row[x];
-                    }
-                }
-            }
-        }
+        size_t img_size = static_cast<size_t>(img_H) * img_W * img_C;
         std::string img_fn = get_bin_file_path("amba_input_image_frame" + frame_suffix + ".bin");
         std::ofstream img_file(img_fn, std::ios::binary);
         if (img_file.is_open()) {
-            img_file.write(reinterpret_cast<const char*>(dense_hwc.data()), dense_hwc.size() * sizeof(uint8_t));
+            img_file.write(reinterpret_cast<const char*>(raw_data), img_size * sizeof(uint8_t));
             img_file.close();
-            if (logger) logger->info("[Patchifier] Saved AMBA input image to {}: {}x{}x{} (pitch-aware → dense HWC)",
+            if (logger) logger->info("[Patchifier] Saved AMBA input image to {}: {}x{}x{}",
                                      img_fn, img_H, img_W, img_C);
         }
     }

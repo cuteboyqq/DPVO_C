@@ -94,10 +94,5 @@ private:
     void _saveAmbaOutputsForComparison(ea_tensor_t* imgTensor, int fmap_H, int fmap_W,
                                        int inet_output_channels,
                                        std::shared_ptr<spdlog::logger> logger);
-
-    // Helper: save patchify results (coords, gmap, imap, patches) to bin files for a given frame index
-    void _savePatchifyResultsToBinFiles(int frame_index, const float* coords, const float* gmap,
-                                        const float* imap, const float* patches, int M,
-                                        int inet_output_channels);
 };
 

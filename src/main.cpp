@@ -12,7 +12,6 @@
 */
 #include "main.hpp"
 #include <opencv2/opencv.hpp>
-#include <chrono>
 
 
 /**
@@ -24,6 +23,10 @@
  * @param void No input parameters
  * @return void No return value
  */
+// Definitions for DPVO timing globals declared in main.hpp
+std::mutex g_dpvoTimingMutex;
+std::unordered_map<unsigned int, DPVOTimingInfo> g_dpvoTimingMap;
+
 static void usage(void)
 {
 	int i = 0;
@@ -863,10 +866,21 @@ void appDPVOthreadFunction(DPVO& dpvo)
 			if (hasFrame && framePair.first != NULL)
 			{
 				auto logger = spdlog::get("MAIN");
-				if (logger) logger->debug("appDPVOthreadFunction: Calling dpvo.addFrame");
+				const unsigned int frame_index = static_cast<unsigned int>(framePair.second);
+
+				if (logger) logger->debug("appDPVOthreadFunction: Calling dpvo.addFrame for frame {}", frame_index);
+
+				const auto dpvo_start = std::chrono::steady_clock::now();
 				dpvo.addFrame(framePair.first);
-				if (logger) logger->debug("appDPVOthreadFunction: dpvo.addFrame completed");
-			}
+				const auto dpvo_end = std::chrono::steady_clock::now();
+
+				{
+					std::lock_guard<std::mutex> timing_lock(g_dpvoTimingMutex);
+					g_dpvoTimingMap[frame_index] = DPVOTimingInfo{dpvo_start, dpvo_end};
+				}
+
+				if (logger) logger->debug("appDPVOthreadFunction: dpvo.addFrame completed for frame {}", frame_index);
+			} 
 			else
 			{
 				std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1327,16 +1341,13 @@ static bool preprocessImageTensor(ea_tensor_t* imgTensor, Config_S* config, std:
 void processDPVOInput(
 	const std::string& inputPath,
 	const InputType& inputType,
-	std::shared_ptr<spdlog::logger> logger,
-	unsigned int& count,
+	std::shared_ptr<spdlog::logger> logger, 
+	unsigned int& count, 
 	global_param_t* G_param,
 	DPVO* dpvo,
 	int modelH,
 	int modelW,
-	Config_S* config,
-	std::mutex* frameProcessedMutex,
-	std::condition_variable* frameProcessedCV,
-	bool* frameProcessed)
+	Config_S* config)
 {
 	int rval = EA_SUCCESS;
 	
@@ -1449,21 +1460,14 @@ void processDPVOInput(
 			if (logger) {
 				logger->info("preprocessImageTensor: Starting preprocessing for frame {}", count);
 			}
-			
-			// Time image preprocessing (always measure so we can report for pipeline FPS)
-			auto t_image_start = std::chrono::steady_clock::now();
 			if (!preprocessImageTensor(imgTensor, config, logger)) {
 				if (logger) {
 					logger->warn("preprocessImageTensor failed, continuing with original image");
 				}
-			}
-			auto t_image_end = std::chrono::steady_clock::now();
-			double image_ms = std::chrono::duration<double, std::milli>(t_image_end - t_image_start).count();
-			double image_fps = (image_ms > 0.0) ? (1000.0 / image_ms) : 0.0;
-			// Report for overall pipeline FPS (frame_id = count+1 to match DPVO timestamp)
-			dpvo->reportImagePreprocessTime(static_cast<int64_t>(count) + 1, image_ms);
-			if (logger) {
-				logger->info("\033[33m[IMAGE_THREAD] Frame {} | Image preprocessing: {:.2f} ms ({:.1f} FPS)\033[0m", count, image_ms, image_fps);
+			} else {
+				if (logger) {
+					logger->info("preprocessImageTensor: Preprocessing completed successfully");
+				}
 			}
 		} else {
 			if (logger) {
@@ -1511,31 +1515,61 @@ void processDPVOInput(
 			}
 		}
 
+		// Measure per-frame wall-clock time for DPVO pipeline (ingest → DPVO done)
+		const auto frame_start = std::chrono::steady_clock::now();
+		const unsigned int frame_index = count;
+
 		{
 			std::lock_guard<std::mutex> lock(queueMutex);
 			logger->info("Input Source Frame Index = {}", count++);
-			frameQueue.emplace_back(std::pair<ea_tensor_t*, int>(imgTensor, 0));
+			frameQueue.emplace_back(std::pair<ea_tensor_t*, int>(imgTensor, static_cast<int>(frame_index)));
 			logger->info("frameQueue.emplace_back imgTensor finished");
 		}
 
 		frameCondVar.notify_one();
 
-		// Wait for callback: inference thread signals when it has consumed this frame's tensor
-		// (so we can drop the resource and push the next frame; processing may still be running).
-		// This allows inference (frame N+1) and processing (frame N) to run in parallel.
-		if (frameProcessedMutex && frameProcessedCV && frameProcessed) {
-			std::unique_lock<std::mutex> lock(*frameProcessedMutex);
-			frameProcessedCV->wait(lock, [&]() { return *frameProcessed || !run_flag; });
-			if (run_flag) *frameProcessed = false;
-		} else {
+		// Wait for DPVO to process the frame BEFORE dropping the resource
+		// This ensures the tensor remains valid during conversion
+		// Since DPVO doesn't have a callback, we'll wait a bit and check
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		while (!dpvo->isProcessingComplete())
+		{
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-			while (!dpvo->isProcessingComplete())
-				std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
 
-		logger->info("Start ea_img_resource_drop_data (after inference consumed frame)");
+		// Drop the image resource data AFTER processing is complete
+		// This ensures the tensor is no longer needed
+		logger->info("Start ea_img_resource_drop_data (after processing complete)");
 		RVAL_OK(ea_img_resource_drop_data(G_param->img_resource, &data));
 		logger->info("ea_img_resource_drop_data finished");
+
+		// Per-frame timing and FPS (yellow text for visibility)
+		const auto frame_end = std::chrono::steady_clock::now();
+		const double frame_seconds =
+			std::chrono::duration_cast<std::chrono::duration<double>>(frame_end - frame_start).count();
+		const double frame_fps = frame_seconds > 0.0 ? 1.0 / frame_seconds : 0.0;
+
+
+		double yolo_ms = 0.0;
+#if defined(CV28) || defined(CV28_SIMULATOR)
+		yolo_ms = dpvo->getLastYOLOv8InferenceTimeMs();
+#endif
+		if (yolo_ms > 0.0) {
+			logger->info(
+				"\033[93m[DPVO] Frame {} time: {:.3f} s ({:.2f} FPS) | YOLOv8: {:.1f} ms\033[0m",
+				frame_index,
+				frame_seconds,
+				frame_fps,
+				yolo_ms
+			);
+		} else {
+			logger->info(
+				"\033[93m[DPVO] Frame {} time: {:.3f} s ({:.2f} FPS)[0m",
+				frame_index,
+				frame_seconds,
+				frame_fps
+			);
+		}
 	}
 }
 
@@ -1575,6 +1609,8 @@ void processDPVOApp(
 
 	// Process with DPVO App
 	[&]() {
+		const auto pipeline_start = std::chrono::steady_clock::now();
+
 		// Read config file
 		AppConfigReader appConfigReader;
 		appConfigReader.read(configPath);
@@ -1662,6 +1698,7 @@ void processDPVOApp(
 		// Validate dimensions to prevent bad_array_new_length
 		if (ht < 16 || wd < 16) {
 			logger->error("Invalid model input dimensions: {}x{}. Minimum size is 16x16", ht, wd);
+			logger->error("Hint: If using FnetModelPath=.../fnet.onnx, build with -DUSE_ONNX_RUNTIME and link ONNX Runtime. Otherwise use AMBA .json model paths.");
 			throw std::runtime_error("Invalid model input dimensions for DPVO");
 		}
 		
@@ -1680,11 +1717,16 @@ void processDPVOApp(
 
 		// Create DPVO instance with model input dimensions
 		// This ensures fmap/imap buffers match what fnet/inet models output
-		// std::unique_ptr : 
-		// - 1️⃣ 建立 DPVO 物件（在 heap）
-		// - 2️⃣ 讓 dpvo 成為唯一擁有者
-		// - 3️⃣ 當 dpvo 離開 scope，自動 delete
 		std::unique_ptr<DPVO> dpvo(new DPVO(dpvoCfg, ht, wd, config));
+
+		// Set camera intrinsics: fx, fy, cx, cy (at full resolution)
+		// These will be automatically scaled by RES=4 when stored in PatchGraph
+		// User-provided intrinsics: fx=1660.0, fy=1660.0, cx=960.0, cy=540.0
+		// Resolution: 1920x1080
+		// float camera_intrinsics[4] = {1660.0f, 1660.0f, 960.0f, 540.0f};
+		// dpvo->setIntrinsics(camera_intrinsics);
+		// logger->info("Set camera intrinsics: fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}",
+		//              camera_intrinsics[0], camera_intrinsics[1], camera_intrinsics[2], camera_intrinsics[3]);
 
 		// Set fnet and inet models for Patchifier (will create new model instances)
 		// This will also start the processing thread (via _startThreads)
@@ -1724,24 +1766,21 @@ void processDPVOApp(
 			logger->info("Viewer frame saving DISABLED (set SaveViewerFrames = 1 in app_config.txt to enable)");
 		}
 
-		// Frame-processed sync (asha cam style): image thread waits for one result before next frame
+		// Set up frame processed synchronization (similar to WNC_APP pattern)
 		std::mutex frameProcessedMutex;
 		std::condition_variable frameProcessedCV;
 		bool frameProcessed = false;
-		dpvo->setFrameProcessedCallback([&]() {
-			{
-				std::lock_guard<std::mutex> lock(frameProcessedMutex);
-				frameProcessed = true;
-			}
-			frameProcessedCV.notify_one();
-		});
 
+		// Note: DPVO doesn't have a callback mechanism like WNC_APP,
+		// so we'll use a simpler approach - just wait for processing to complete
+		// after each frame is added. We can use a timer or check isProcessingComplete.
 		logger->error("Start dpvoThread");
 		std::thread dpvoThread(appDPVOthreadFunction, std::ref(*dpvo));
 		logger->error("dpvoThread started");
 		unsigned int count = 0;
-
+		
 		logger->error("Start processDPVOInput");
+		// Process input frames using the dedicated function
 		processDPVOInput(
 			inputPath,
 			inputType,
@@ -1751,10 +1790,7 @@ void processDPVOApp(
 			dpvo.get(),
 			ht,
 			wd,
-			config,
-			&frameProcessedMutex,
-			&frameProcessedCV,
-			&frameProcessed);
+			config);
 		logger->error("processDPVOInput finished");
 		// Signal completion and wait for thread
 		{
@@ -1768,14 +1804,27 @@ void processDPVOApp(
 			dpvoThread.join();
 		}
 
-		// Stop DPVO's internal threads (inference and processing)
-		dpvo->terminate();
+		// Stop DPVO's internal processing thread
+		dpvo->stopProcessingThread();
 
 		while (!dpvo->isProcessingComplete())
 		{
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			logger->info("Waiting for DPVO thread to finish...");
 		}
+
+		// Total pipeline timing (ingest + DPVO processing for all frames)
+		const auto pipeline_end = std::chrono::steady_clock::now();
+		const double pipeline_seconds =
+			std::chrono::duration_cast<std::chrono::duration<double>>(pipeline_end - pipeline_start).count();
+		const double avg_fps = pipeline_seconds > 0.0 ? static_cast<double>(count) / pipeline_seconds : 0.0;
+
+		logger->info(
+			"\033[93m[DPVO] Total pipeline time: {:.3f} s, frames: {}, average FPS: {:.2f}\033[0m",
+			pipeline_seconds,
+			count,
+			avg_fps
+		);
 	}();
 
 	return;

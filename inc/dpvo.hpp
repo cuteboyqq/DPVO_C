@@ -1,11 +1,20 @@
 #pragma once
 #include "patch_graph.hpp"
+#include "detection_3d.hpp"  // Detection3D (for m_lastDetections3D)
 #include "patchify.hpp"  // Patchifier
 #include "update.hpp"    // DPVOUpdate
 #ifdef USE_ONNX_RUNTIME
 #include "update_onnx.hpp"  // DPVOUpdateONNX
 #endif
 #include "dla_config.hpp"
+#if defined(CV28) || defined(CV28_SIMULATOR)
+#include "yolov8.hpp"
+#include "yolov8_decoder.hpp"
+#include "dataStructures.h"
+#ifdef USE_ONNX_RUNTIME
+#include "yolov8_onnx.hpp"
+#endif
+#endif
 #if defined(CV28) || defined(CV28_SIMULATOR)
 #include <eazyai.h>
 #endif
@@ -18,12 +27,9 @@
 #include <condition_variable>
 #include <atomic>
 #include <queue>
-#include <unordered_map>
-#include <functional>
 
-// Forward declarations
+// Forward declaration
 class DPVOViewer;
-namespace spdlog { class logger; }
 
 struct DPVOConfig {
     int PATCHES_PER_FRAME;
@@ -71,12 +77,9 @@ public:
                           float* patches, uint8_t* clr, const uint8_t* image_for_viewer = nullptr);
     
     // Threading interface (similar to wnc_app)
-    void startInferenceThread();   // FNet/INet inference thread
-    void stopInferenceThread();
-    void startProcessingThread();  // Processing thread (patchify, reproject, correlation, update, BA)
+    void startProcessingThread();
     void stopProcessingThread();
     void wakeProcessingThread();
-    void wakeInferenceThread();
 #if defined(CV28) || defined(CV28_SIMULATOR)
     void updateInput(ea_tensor_t* imgTensor);
     void addFrame(ea_tensor_t* imgTensor);  // Convenience wrapper like wnc_app
@@ -86,13 +89,6 @@ public:
     void addFrame(const uint8_t* image, int H, int W);
 #endif
     bool isProcessingComplete();
-
-    // Frame-processed callback (asha cam style): called when processing thread finishes one frame
-    void setFrameProcessedCallback(std::function<void()> callback) { m_frameProcessedCallback = std::move(callback); }
-
-    // Per-frame pipeline timing: report stage times to compute overall FPS per frame
-    void reportImagePreprocessTime(int64_t frame_id, double ms);
-    void reportInferenceTime(int64_t frame_id, double ms);
     
     // Set intrinsics (can be called to update from config)
     void setIntrinsics(const float intrinsics[4]);
@@ -125,6 +121,11 @@ public:
     void enableVisualization(bool enable = true);
     void enableFrameSaving(const std::string& output_dir);  // Save viewer frames to disk
     void updateViewer();  // Update viewer with current state
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    /** Last YOLOv8 inference time in ms (0 if not run or disabled). Used for per-frame log in main. */
+    double getLastYOLOv8InferenceTimeMs() const { return m_lastYOLOv8InferenceTimeMs; }
+#endif
 
 private:
     // Forward declaration for InputFrame (defined later in private section)
@@ -276,62 +277,16 @@ private:
 #endif
     };
     
-    // Structure to pass inference results from inference thread to processing thread
-    struct InferenceResult {
-        int64_t timestamp;
-        int H, W;
-        std::vector<float> fmap_buffer;  // FNet output: [128, fmap_H, fmap_W] - full feature map
-        std::vector<float> imap_patches; // INet patch features: [M, 384] - extracted patch features
-        std::vector<float> gmap_patches; // FNet patch features: [M, 128, 3, 3] - extracted patch features
-        std::vector<float> patches;      // Extracted patches: [M, 3, patch_D, patch_D]
-        std::vector<uint8_t> clr;        // Patch colors: [M, 3]
-        std::vector<uint8_t> image_data; // Image data for viewer (if visualization enabled)
-        const uint8_t* image_ptr;        // Pointer to image data
-#if defined(CV28) || defined(CV28_SIMULATOR)
-        ea_tensor_t* tensor_img;         // Original tensor (for reference, may be nullptr after inference)
-#endif
-    };
-    
-    // Helper function to process inference results in processing thread
-    void processInferenceResult(const InferenceResult& result);
-    
     // ---- Intrinsics and timestamp (stored as member variables) ----
     float m_intrinsics[4];      // Camera intrinsics [fx, fy, cx, cy]
-    int64_t m_currentTimestamp; // Current frame timestamp (written only by processing thread)
-    std::atomic<int64_t> m_nextInferenceTimestamp{1}; // Monotonic counter for inference; only inference thread writes
+    int64_t m_currentTimestamp; // Current frame timestamp
     
-    // Inference thread (FNet/INet)
-    std::thread m_inferenceThread;
-    std::atomic<bool> m_inferenceThreadRunning{false};
-    std::mutex m_inferenceQueueMutex;
-    std::condition_variable m_inferenceQueueCV;
-    std::queue<InputFrame> m_inputFrameQueue;  // Input queue for inference thread
-    // Owned copy of input tensor data so we can run FNet/INet from it and then callback (drop resource)
-    // without use-after-free; only inference thread uses this.
-    std::vector<uint8_t> m_inferenceInputCopyBuffer;
-    
-    // Processing thread (patchify, reproject, correlation, update, BA, etc.)
     std::thread m_processingThread;
     std::atomic<bool> m_processingThreadRunning{false};
-    std::mutex m_inferenceResultMutex;
-    std::condition_variable m_inferenceResultCV;
-    std::queue<InferenceResult> m_inferenceResultQueue;  // Queue from inference to processing thread
+    std::mutex m_queueMutex;
+    std::condition_variable m_queueCV;
+    std::queue<InputFrame> m_inputFrameQueue;
     std::atomic<bool> m_bDone{true};
-
-    std::function<void()> m_frameProcessedCallback;
-
-    // Per-frame pipeline timing (image + inference + processing) for overall FPS
-    struct PerFrameTiming {
-        double image_ms = -1.0;
-        double inference_ms = -1.0;
-        double processing_ms = -1.0;
-    };
-    std::unordered_map<int64_t, PerFrameTiming> m_frameTimings;
-    std::mutex m_frameTimingsMutex;
-
-    // Log pipeline FPS for one frame and clear its timing entry (call from processing thread)
-    void _logAndClearPipelineTiming(int64_t frame_timestamp, double processing_ms,
-                                   const std::shared_ptr<spdlog::logger>& logger);
     
     // Helper function to check if there's work to do
     bool _hasWorkToDo();
@@ -339,6 +294,25 @@ private:
     // Visualization (optional)
     std::unique_ptr<DPVOViewer> m_viewer;
     bool m_visualizationEnabled{false};
+    bool m_enableShow3DDetection{true};  // From app_config EnableShow3DDetection (0/1): show 3D object detection in viewer
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    // YOLOv8 (optional; when yolov8ModelPath is set). Use ONNX if UseOnnxRuntime=1, else AMBA.
+    std::unique_ptr<YOLOv8> m_yolov8;
+#ifdef USE_ONNX_RUNTIME
+    std::unique_ptr<YOLOv8ONNX> m_yolov8_onnx;
+#endif
+    std::unique_ptr<YOLOv8_Decoder> m_yolov8Decoder;
+    std::vector<std::vector<v8xyxy>> m_lastYOLOv8Boxes;
+    std::mutex m_yolov8BoxesMutex;
+    double m_lastYOLOv8InferenceTimeMs = 0.0;
+    // YOLOv8 model input size (set when YOLOv8 runs); used for 3D unproject intrinsics scaling
+    int m_yolov8InputW = 0;
+    int m_yolov8InputH = 0;
+    // 3D detections (from YOLOv8 bbox center + ground-plane unproject) for viewer
+    std::vector<Detection3D> m_lastDetections3D;
+    std::mutex m_detections3DMutex;
+#endif
     
     // Store all historical poses for visualization (not just sliding window)
     // This allows the viewer to show the full trajectory, not just the current optimization window
